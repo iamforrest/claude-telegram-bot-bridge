@@ -6,6 +6,30 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Check if installation is complete
+if [ ! -d "$VENV_DIR" ] || [ ! -f "$ENV_FILE" ]; then
+    echo ""
+    echo -e "${RED}❌ Installation not found${NC}"
+    echo ""
+    echo "Please run the installation script first:"
+    echo -e "  ${BLUE}./install.sh${NC}"
+    echo ""
+    echo "The installation wizard will guide you through:"
+    echo "  • System requirements check"
+    echo "  • Bot configuration (Token, whitelist, proxy)"
+    echo "  • Python environment setup"
+    echo ""
+    exit 1
+fi
 
 ACTION="run"
 DAEMON_MODE=0  # Default to foreground mode
@@ -446,27 +470,9 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# Check virtual environment
-if [ -d "$VENV_DIR" ]; then
-    echo "✅ Virtual environment found"
-    source "$VENV_DIR/bin/activate"
-else
-    echo "📝 Creating virtual environment..."
-    python3 -m venv "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-fi
-
-# Install dependencies (hash cache, skip if unchanged)
-REQ_HASH_FILE="$VENV_DIR/.req_hash"
-REQ_HASH="$(md5 -q "$REQ_FILE" 2>/dev/null || md5sum "$REQ_FILE" | cut -d' ' -f1)"
-if [ ! -f "$REQ_HASH_FILE" ] || [ "$(cat "$REQ_HASH_FILE")" != "$REQ_HASH" ]; then
-    echo "📦 Dependencies changed, installing..."
-    pip install -q --upgrade pip
-    pip install -q -r "$REQ_FILE"
-    echo "$REQ_HASH" > "$REQ_HASH_FILE"
-else
-    echo -e "\033[90m📦 Dependencies unchanged, skipping install\033[0m"
-fi
+# Activate virtual environment
+echo "✅ Activating virtual environment"
+source "$VENV_DIR/bin/activate"
 
 # Clean up logs older than 14 days (at most once per day)
 CLEANUP_MARKER="$BOT_DATA_DIR/.last_cleanup"
@@ -492,7 +498,7 @@ while true; do
     echo "================================"
 
     start_time=$(date +%s)
-    python -m telegram_bot --path "$PROJECT_ROOT" &
+    "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" &
     BOT_PID=$!
     wait $BOT_PID
     exit_code=$?

@@ -46,44 +46,51 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 
 ## Quick Start
 
-1. **Set up the environment:**
-
 ```bash
-cd telegram_bot
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/terranc/claude-telegram-bot-bridge
+cd claude-telegram-bot-bridge
+claude
 ```
 
-2. **Configure:**
+Then run `/setup`. Claude Code will handle everything: system checks, bot token collection, dependency installation, and configuration.
+
+> **Note:** Commands starting with `/` (like `/setup`) are [Claude Code skills](https://code.claude.com/docs/en/skills). Type them in the `claude` CLI prompt, not in your regular terminal.
+
+Once setup is complete, start the bot:
 
 ```bash
-cp .env.example .env
-# Edit .env — add your TELEGRAM_BOT_TOKEN
+./start.sh --path /path/to/your/project
 ```
 
-3. **Set up a global alias** (recommended) — add to `~/.zshrc` or `~/.bashrc`:
+<details>
+<summary>Alternative: Direct installation script</summary>
+
+If you prefer not to use Claude Code, run the installation script directly:
 
 ```bash
-alias tgbot='/absolute/path/to/telegram_bot/start.sh --path'
+git clone https://github.com/terranc/claude-telegram-bot-bridge
+cd claude-telegram-bot-bridge
+./install.sh
 ```
 
-Then start from any project directory:
+Then start the bot:
 
 ```bash
-cd ~/my-project
-tgbot .                # Start bot for current directory
-tgbot . --debug        # Debug mode
-tgbot . --status       # Check if running
-tgbot . --stop         # Stop
+./start.sh --path /path/to/your/project
 ```
 
-4. **Or call `start.sh` directly:**
+</details>
+
+### Common Commands
 
 ```bash
-./start.sh --help                                # Show help
-./start.sh --path /path/to/project              # Foreground (default)
-./start.sh --path /path/to/project -d           # Daemon/background
-./start.sh --path /path/to/project --debug       # Debug mode
+./start.sh --path /path/to/project              # Start (foreground)
+./start.sh --path /path/to/project -d           # Start (daemon/background)
+./start.sh --path /path/to/project --debug      # Debug mode
+./start.sh --path /path/to/project --status     # Check status
+./start.sh --path /path/to/project --stop       # Stop
+./start.sh --path /path/to/project --install    # Install as macOS startup service
+./start.sh --path /path/to/project --uninstall  # Remove startup service
 ```
 
 ## Usage Examples

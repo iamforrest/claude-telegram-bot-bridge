@@ -26,7 +26,12 @@ env/
 *.swp
 *.swo
 
-.claude
+# Claude Code (except setup skill)
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/setup/
+
 .git
 .skillshare/
 

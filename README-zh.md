@@ -46,44 +46,51 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 
 ## 快速开始
 
-1. **配置环境：**
-
 ```bash
-cd telegram_bot
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+git clone https://github.com/terranc/claude-telegram-bot-bridge
+cd claude-telegram-bot-bridge
+claude
 ```
 
-2. **配置：**
+然后运行 `/setup`。Claude Code 会处理一切：系统检查、Bot Token 收集、依赖安装和配置。
+
+> **注意：** 以 `/` 开头的命令（如 `/setup`）是 [Claude Code 技能](https://code.claude.com/docs/en/skills)。请在 `claude` CLI 提示符中输入，而非在普通终端中。
+
+设置完成后，启动 Bot：
 
 ```bash
-cp .env.example .env
-# 编辑 .env — 填入你的 TELEGRAM_BOT_TOKEN
+./start.sh --path /path/to/your/project
 ```
 
-3. **配置全局别名**（推荐）— 添加到 `~/.zshrc` 或 `~/.bashrc`：
+<details>
+<summary>备选方案：直接运行安装脚本</summary>
+
+如果你不想使用 Claude Code，可以直接运行安装脚本：
 
 ```bash
-alias tgbot='/absolute/path/to/telegram_bot/start.sh --path'
+git clone https://github.com/terranc/claude-telegram-bot-bridge
+cd claude-telegram-bot-bridge
+./install.sh
 ```
 
-然后在任意项目目录下启动：
+然后启动 Bot：
 
 ```bash
-cd ~/my-project
-tgbot .                # 以当前目录启动 Bot
-tgbot . --debug        # 调试模式
-tgbot . --status       # 查看运行状态
-tgbot . --stop         # 停止
+./start.sh --path /path/to/your/project
 ```
 
-4. **或直接调用 `start.sh`：**
+</details>
+
+### 常用命令
 
 ```bash
-./start.sh --help                                # 显示帮助
-./start.sh --path /path/to/project              # 前台运行（默认）
-./start.sh --path /path/to/project -d           # 后台守护进程
-./start.sh --path /path/to/project --debug       # 调试模式
+./start.sh --path /path/to/project              # 启动（前台）
+./start.sh --path /path/to/project -d           # 启动（后台守护进程）
+./start.sh --path /path/to/project --debug      # 调试模式
+./start.sh --path /path/to/project --status     # 查看状态
+./start.sh --path /path/to/project --stop       # 停止
+./start.sh --path /path/to/project --install    # 安装为 macOS 开机自启服务
+./start.sh --path /path/to/project --uninstall  # 移除开机自启服务
 ```
 
 ## 使用场景
