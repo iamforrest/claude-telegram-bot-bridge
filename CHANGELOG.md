@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-05
+
+### Added
+- Native Telegram voice message support with automatic transcription via OpenAI Whisper API
+- Audio format detection and conversion (OGG/AMR → MP3) using ffmpeg
+- Voice message preview in chat: `🎤 Voice: [transcribed text]` before forwarding to Claude
+- Priority `/stop` command: immediately cancels running tasks and voice transcription, even when message queue is full
+- Comprehensive test coverage for audio processing, transcription, and voice message flow
+- Voice configuration options: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `WHISPER_MODEL`, `MAX_VOICE_DURATION`, `FFMPEG_PATH`
+- Automatic cleanup of temporary audio files and stale audio detection
+- Retry logic with exponential backoff for Whisper API calls
+- Voice message duration validation and cost/duration logging
+
+### Changed
+- `/setup` skill now includes optional voice message configuration step
+- `.env.example` updated with voice-related configuration options
+- Enhanced error handling for voice message processing with user-friendly error messages
+- Updated documentation (README, CLAUDE.md) with voice message feature details
+
 ## [0.4.0] - 2026-03-04
 
 ### Added

@@ -8,11 +8,14 @@ from pathlib import Path as FilePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 from datetime import datetime, timezone
 
-STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 import telegram.error
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
-    BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
 )
 from telegram.ext import (
@@ -21,28 +24,44 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
+    filters,
 )
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.project_chat import project_chat_handler, ChatResponse
 from claude_code_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram_bot.utils.chat_logger import log_debug
+from telegram_bot.utils.audio_processor import AudioProcessor
+from telegram_bot.utils.transcription import (
+    EmptyTranscriptionError,
+    TranscriptionError,
+    WhisperTranscriber,
+)
 
 logger = logging.getLogger(__name__)
+STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
+
 
 def _esc_md2(text: str) -> str:
     """Escape MarkdownV2 special characters."""
-    return re.sub(r'([_*\[\]()~`>#+=|{}.!\\-])', r'\\\1', text)
+    return re.sub(r"([_*\[\]()~`>#+=|{}.!\\-])", r"\\\1", text)
+
 
 class TelegramBot:
     def __init__(self):
         self.application: Optional[Application] = None
         # Only sessions created/resumed in current runtime are auto-resumed.
         self._runtime_active_sessions: set[int] = set()
+        self._runtime_active_voice_sessions: set[int] = set()
         self._user_run_tasks: Dict[int, set[asyncio.Task]] = {}
+        self._user_voice_tasks: Dict[int, set[asyncio.Task]] = {}
         self._user_queue_locks: Dict[int, asyncio.Lock] = {}
-    
+        # Track currently executing task per user for priority stop command
+        self._active_tasks: Dict[int, asyncio.Task] = {}
+        self._audio_dir = config.bot_data_dir / "audio"
+        self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
+        self._whisper_transcriber: Optional[WhisperTranscriber] = None
+
     # Available models for /model command
     MODELS = [
         ("sonnet", "Claude Sonnet"),
@@ -54,9 +73,16 @@ class TelegramBot:
     _DENY_OUTSIDE_TOKEN = "DENY_OUTSIDE"
     _PATH_KEYWORDS = ("path", "file", "cwd", "dir", "directory", "root")
     _MAX_INFLIGHT_MESSAGES = 3
+    _STALE_AUDIO_SECONDS = 24 * 60 * 60
 
     async def _post_init(self, application: Application):
         """Called after application.initialize() by run_polling()"""
+        self._audio_dir.mkdir(parents=True, exist_ok=True)
+        removed = await self._cleanup_stale_audio_files(
+            self._audio_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
+        )
+        if removed:
+            logger.info("Startup audio cleanup removed %s stale file(s)", removed)
         await self._set_bot_commands()
         logger.info("✅ Bot initialization complete")
 
@@ -121,7 +147,9 @@ class TelegramBot:
         if msg and msg.date:
             age = (datetime.now(timezone.utc) - msg.date).total_seconds()
             if age > STALE_MESSAGE_SECONDS:
-                logger.debug(f"Dropping stale message ({age:.0f}s old) from {update.effective_user}")
+                logger.debug(
+                    f"Dropping stale message ({age:.0f}s old) from {update.effective_user}"
+                )
                 return False
 
         user = update.effective_user
@@ -132,10 +160,16 @@ class TelegramBot:
         if not self._check_user_access(user.id):
             # Send different rejection messages based on update type
             if update.message:
-                await update.message.reply_text(
-                    "⛔ Sorry, you don't have permission to use this bot.\n"
-                    "Please contact the admin for access."
-                )
+                if update.message.voice:
+                    await update.message.reply_text(
+                        "⛔ You don't have permission to send voice messages to this bot.\n"
+                        "Please contact the admin for access."
+                    )
+                else:
+                    await update.message.reply_text(
+                        "⛔ Sorry, you don't have permission to use this bot.\n"
+                        "Please contact the admin for access."
+                    )
             elif update.callback_query:
                 await update.callback_query.answer(
                     "⛔ No permission to use this feature", show_alert=True
@@ -144,8 +178,18 @@ class TelegramBot:
         return True
 
     @staticmethod
+    def _is_priority_command(text: str) -> bool:
+        """Check if a command should be processed with priority (bypass queue).
+
+        Priority commands are processed immediately without queue limit checks.
+        Currently only /stop is a priority command.
+        """
+        return text.strip() == "/stop"
+
+    @staticmethod
     def _is_within_project_root(path: FilePath) -> bool:
         from telegram_bot.core.project_chat import PROJECT_ROOT
+
         try:
             return path.resolve(strict=False).is_relative_to(PROJECT_ROOT)
         except Exception:
@@ -154,6 +198,7 @@ class TelegramBot:
     @staticmethod
     def _resolve_candidate_path(raw_path: str) -> FilePath:
         from telegram_bot.core.project_chat import PROJECT_ROOT
+
         candidate = FilePath(raw_path.strip().strip("\"'")).expanduser()
         if not candidate.is_absolute():
             candidate = PROJECT_ROOT / candidate
@@ -203,7 +248,9 @@ class TelegramBot:
             if isinstance(value, dict):
                 for key, item in value.items():
                     key_lower = key.lower()
-                    if isinstance(item, str) and any(word in key_lower for word in self._PATH_KEYWORDS):
+                    if isinstance(item, str) and any(
+                        word in key_lower for word in self._PATH_KEYWORDS
+                    ):
                         add_candidate(item)
                     else:
                         walk(item, key_lower)
@@ -256,14 +303,18 @@ class TelegramBot:
             return
 
         normalized = text.strip().lower()
-        allow = (
-            self._ALLOW_OUTSIDE_ONCE_TOKEN.lower() in normalized
-            or normalized in {"1", "allow", "yes", "y"}
-        )
-        deny = (
-            self._DENY_OUTSIDE_TOKEN.lower() in normalized
-            or normalized in {"2", "deny", "no", "n"}
-        )
+        allow = self._ALLOW_OUTSIDE_ONCE_TOKEN.lower() in normalized or normalized in {
+            "1",
+            "allow",
+            "yes",
+            "y",
+        }
+        deny = self._DENY_OUTSIDE_TOKEN.lower() in normalized or normalized in {
+            "2",
+            "deny",
+            "no",
+            "n",
+        }
 
         if allow:
             session["outside_path_approved_once"] = True
@@ -335,7 +386,9 @@ class TelegramBot:
         if not session_id:
             return None
         if user_id not in self._runtime_active_sessions:
-            logger.info(f"Ignoring persisted session_id for user {user_id} (not active in current runtime)")
+            logger.info(
+                f"Ignoring persisted session_id for user {user_id} (not active in current runtime)"
+            )
             return None
         return session_id
 
@@ -347,24 +400,27 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
+        self.application.add_handler(CommandHandler("history", self._cmd_history))
         self.application.add_handler(CommandHandler("command", self._cmd_command))
         self.application.add_handler(CommandHandler("skill", self._cmd_skill))
-        
+
         # Skill command handler - catches all /commands
         self.application.add_handler(
-            MessageHandler(filters.COMMAND, self._handle_skill_command),
-            group=1
+            MessageHandler(filters.COMMAND, self._handle_skill_command), group=1
         )
-        
+
         # Text message handler - for answers to questions
         self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
-            group=2
+            MessageHandler(filters.VOICE, self._handle_voice_message), group=2
         )
-        
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
+            group=2,
+        )
+
         # Callback query handler - for inline keyboards
         self.application.add_handler(CallbackQueryHandler(self._handle_callback))
-    
+
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_access(update):
             return
@@ -410,6 +466,14 @@ class TelegramBot:
         user_id = update.effective_user.id
         log_debug(user_id, "command", "/new")
 
+        cancelled_voice = await self._cancel_user_voice_tasks(user_id)
+        if cancelled_voice:
+            logger.info(
+                "Cancelled %s active voice task(s) for user %s on /new",
+                cancelled_voice,
+                user_id,
+            )
+
         # Cancel any ongoing streaming
         await self._cancel_user_streaming(user_id)
 
@@ -419,7 +483,7 @@ class TelegramBot:
 
         # Sync session model with settings.json; clear if settings changed
         try:
-            with open(config.claude_settings_path, 'r') as f:
+            with open(config.claude_settings_path, "r") as f:
                 settings_model = json.load(f).get("model")
         except Exception:
             settings_model = None
@@ -428,8 +492,14 @@ class TelegramBot:
             old_model = session.get("model")
             session["model"] = settings_model
             effective = self._get_real_model(session)
-            logger.info(f"User {user_id}: model synced {old_model!r} -> {settings_model!r} (effective: {effective!r}) on /new")
-            log_debug(user_id, "model", f"Auto-synced model: {old_model} -> {settings_model} (effective: {effective})")
+            logger.info(
+                f"User {user_id}: model synced {old_model!r} -> {settings_model!r} (effective: {effective!r}) on /new"
+            )
+            log_debug(
+                user_id,
+                "model",
+                f"Auto-synced model: {old_model} -> {settings_model} (effective: {effective})",
+            )
 
         await session_manager.update_session(user_id, session)
         self._runtime_active_sessions.discard(user_id)
@@ -442,7 +512,7 @@ class TelegramBot:
         if model := session.get("model"):
             return model
         try:
-            with open(config.claude_settings_path, 'r') as f:
+            with open(config.claude_settings_path, "r") as f:
                 return json.load(f).get("model", "sonnet")
         except Exception:
             return "sonnet"
@@ -470,14 +540,18 @@ class TelegramBot:
         if current_model not in dict(models):
             models.append((current_model, current_model))
         buttons = [
-            [InlineKeyboardButton(
-                f"{label} (current)" if name == current_model else label,
-                callback_data=f"model:{name}"
-            )]
+            [
+                InlineKeyboardButton(
+                    f"{label} (current)" if name == current_model else label,
+                    callback_data=f"model:{name}",
+                )
+            ]
             for name, label in models
         ]
         reply = "🤖 Select Claude Code model:"
-        await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons))
+        await update.message.reply_text(
+            reply, reply_markup=InlineKeyboardMarkup(buttons)
+        )
         log_debug(user_id, "bot", reply)
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -498,7 +572,7 @@ class TelegramBot:
         await session_manager.update_session(user_id, session)
 
         def _esc_resume_text(text: str) -> str:
-            text = re.sub(r'https?://\S+', '', text).strip()
+            text = re.sub(r"https?://\S+", "", text).strip()
             return _esc_md2(text)
 
         def relative_time(mtime: float) -> str:
@@ -511,7 +585,7 @@ class TelegramBot:
                 return f"{delta // 3600} hours ago"
             return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
 
-        NUM_EMOJI = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+        NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
         lines = ["📋 *Session History*\n"]
         for i, (sid, msg, mtime) in enumerate(sessions, 1):
@@ -528,35 +602,105 @@ class TelegramBot:
         log_debug(user_id, "bot", reply)
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stop - kill the active CLI process for this user."""
+        """Handle /stop - interrupt active execution and clear queue.
+
+        This command has priority handling - it bypasses queue limits and
+        immediately cancels any running task for the user.
+        """
         if not await self._check_access(update):
             return
         user_id = update.effective_user.id
         log_debug(user_id, "command", "/stop")
 
+        cancelled_voice = await self._cancel_user_voice_tasks(user_id)
+        if cancelled_voice:
+            logger.info(
+                "Cancelled %s active voice task(s) for user %s on /stop",
+                cancelled_voice,
+                user_id,
+            )
+
         # Cancel any ongoing streaming
         await self._cancel_user_streaming(user_id)
+
+        # Cancel the currently executing task (priority stop)
+        active_task = self._active_tasks.get(user_id)
+        task_cancelled = False
+        if active_task and not active_task.done():
+            active_task.cancel()
+            task_cancelled = True
+            logger.info(
+                "Cancelled active task for user %s via priority /stop command",
+                user_id,
+            )
 
         killed = await project_chat_handler.stop(user_id)
         cleared = self._clear_user_queue(user_id)
 
-        # Clear cached model so next session reads fresh config from settings.json
-        session = await session_manager.get_session(user_id)
-        old_model = session.get("model")
-        session["model"] = None
-        await session_manager.update_session(user_id, session)
-        if old_model:
-            effective = self._get_real_model(session)
-            logger.info(f"User {user_id}: model cache cleared ({old_model!r}) on /stop, effective: {effective!r}")
-            log_debug(user_id, "model", f"Cleared cached model: {old_model} -> None (next will use: {effective})")
-        if killed and cleared:
-            reply = f"🛑 Current task terminated and {cleared} queued message(s) cleared."
-        elif killed:
-            reply = "🛑 Current Claude Code process terminated."
-        elif cleared:
-            reply = f"🧹 No running task. Cleared {cleared} queued message(s)."
+        # Build response message - simple and friendly
+        if task_cancelled or killed or cleared:
+            reply = "⏸️ Paused"
         else:
-            reply = "ℹ️ No task is currently running."
+            reply = "ℹ️ Nothing running"
+        await update.message.reply_text(reply)
+        log_debug(user_id, "bot", reply)
+
+    async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /history - display recent messages from current session."""
+        if not await self._check_access(update):
+            return
+        user_id = update.effective_user.id
+        log_debug(user_id, "command", "/history")
+
+        session = await session_manager.get_session(user_id)
+        session_id = session.get("session_id")
+
+        if not session_id:
+            reply = "📭 No active session. Start a conversation first."
+            await update.message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        messages = project_chat_handler.get_recent_messages(session_id, limit=5)
+
+        if not messages:
+            reply = "📭 No history available for this session."
+            await update.message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+            return
+
+        lines = ["📜 Recent History (last 5 messages)\n"]
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            timestamp = msg["timestamp"]
+
+            # Format emoji indicator
+            emoji = "🧑" if role == "user" else "🤖"
+            role_label = "User" if role == "user" else "Assistant"
+
+            # Format timestamp
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_str = timestamp[:19] if len(timestamp) >= 19 else timestamp
+
+            # Truncate content
+            if len(content) > 500:
+                content = content[:500] + "..."
+
+            lines.append(f"{emoji} {role_label} [{ts_str}]")
+            lines.append(content)
+            lines.append("")
+
+        reply = "\n".join(lines).strip()
+
+        # Ensure total length under 4000 chars
+        if len(reply) > 4000:
+            reply = reply[:3997] + "..."
+
         await update.message.reply_text(reply)
         log_debug(user_id, "bot", reply)
 
@@ -566,8 +710,7 @@ class TelegramBot:
         if isinstance(update, Update) and update.effective_chat:
             try:
                 await context.bot.send_message(
-                    update.effective_chat.id,
-                    f"❌ Internal error: {context.error}"
+                    update.effective_chat.id, f"❌ Internal error: {context.error}"
                 )
             except Exception:
                 pass
@@ -579,6 +722,59 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Failed to cancel streaming for user {user_id}: {e}")
             return False
+
+    def _prune_voice_tasks(self, user_id: int) -> set[asyncio.Task]:
+        tasks = self._user_voice_tasks.get(user_id)
+        if not tasks:
+            tasks = set()
+            self._user_voice_tasks[user_id] = tasks
+            return tasks
+        done = {t for t in tasks if t.done()}
+        tasks.difference_update(done)
+        return tasks
+
+    def _track_voice_task(self, user_id: int, task: asyncio.Task) -> None:
+        tasks = self._prune_voice_tasks(user_id)
+        tasks.add(task)
+        self._runtime_active_voice_sessions.add(user_id)
+
+        def _on_done(t: asyncio.Task) -> None:
+            current = self._user_voice_tasks.get(user_id)
+            if current is not None:
+                current.discard(t)
+                if not current:
+                    self._runtime_active_voice_sessions.discard(user_id)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                logger.debug("Voice task cancelled for user %s", user_id)
+            except Exception as exc:
+                logger.error(
+                    "Voice task failed for user %s: %s", user_id, exc, exc_info=True
+                )
+
+        task.add_done_callback(_on_done)
+
+    async def _cancel_user_voice_tasks(self, user_id: int) -> int:
+        tasks = self._prune_voice_tasks(user_id)
+        cancelled = 0
+        for task in list(tasks):
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        if tasks:
+            await asyncio.gather(*list(tasks), return_exceptions=True)
+        tasks.clear()
+        self._runtime_active_voice_sessions.discard(user_id)
+        return cancelled
+
+    async def _cleanup_stale_audio_files(
+        self, audio_dir: FilePath, max_age_seconds: int
+    ) -> int:
+        return await self._audio_processor.cleanup_stale_audio_files(
+            audio_dir=audio_dir,
+            max_age_seconds=max_age_seconds,
+        )
 
     def _get_user_queue_lock(self, user_id: int) -> asyncio.Lock:
         lock = self._user_queue_locks.get(user_id)
@@ -610,7 +806,9 @@ class TelegramBot:
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"Background task failed for user {user_id}: {e}", exc_info=True)
+                logger.error(
+                    f"Background task failed for user {user_id}: {e}", exc_info=True
+                )
 
         task.add_done_callback(_on_done)
 
@@ -636,7 +834,21 @@ class TelegramBot:
             if len(tasks) >= self._MAX_INFLIGHT_MESSAGES:
                 accepted_task = None
             else:
-                accepted_task = asyncio.create_task(run_task())
+                # Wrap run_task to track active task execution
+                async def wrapped_task():
+                    # Store as active task when execution starts
+                    current_task = asyncio.current_task()
+                    self._active_tasks[user_id] = current_task
+                    try:
+                        await run_task()
+                    except asyncio.CancelledError:
+                        # Re-raise to ensure cancellation propagates
+                        raise
+                    finally:
+                        # Remove from active tasks when done
+                        self._active_tasks.pop(user_id, None)
+
+                accepted_task = asyncio.create_task(wrapped_task())
                 self._track_user_task(user_id, accepted_task)
 
         if not accepted_task:
@@ -673,11 +885,19 @@ class TelegramBot:
                 session_id=self._effective_session_id(user_id, session),
                 model=session.get("model"),
                 permission_callback=self._permission_callback,
-                typing_callback=lambda: update.message.chat.send_action(action="typing"),
+                typing_callback=lambda: update.message.chat.send_action(
+                    action="typing"
+                ),
                 bot=self.application.bot,
             )
             await self._save_session_id(user_id, response)
-            await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
+            await self._reply_smart(
+                update.message,
+                response.content,
+                parse_mode="Markdown",
+                force_options=response.has_options,
+                streamed=response.streamed,
+            )
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
@@ -686,7 +906,17 @@ class TelegramBot:
 
         await self._enqueue_user_task(user_id, run_task, on_overflow)
 
-    _BUILTIN_COMMANDS = {"start", "skills", "new", "model", "resume", "stop", "command", "skill"}
+    _BUILTIN_COMMANDS = {
+        "start",
+        "skills",
+        "new",
+        "model",
+        "resume",
+        "stop",
+        "history",
+        "command",
+        "skill",
+    }
 
     async def _exec_slash_command(self, update: Update, slash_cmd: str):
         """Execute a slash command via Claude Code CLI and reply."""
@@ -703,11 +933,19 @@ class TelegramBot:
                     session_id=self._effective_session_id(user_id, session),
                     model=session.get("model"),
                     permission_callback=self._permission_callback,
-                    typing_callback=lambda: update.message.chat.send_action(action="typing"),
+                    typing_callback=lambda: update.message.chat.send_action(
+                        action="typing"
+                    ),
                     bot=self.application.bot,
                 )
                 await self._save_session_id(user_id, response)
-                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
+                await self._reply_smart(
+                    update.message,
+                    response.content,
+                    parse_mode="Markdown",
+                    force_options=response.has_options,
+                    streamed=response.streamed,
+                )
             except Exception as e:
                 logger.error(f"Skill execution failed: {e}", exc_info=True)
                 await update.message.reply_text(f"❌ Execution failed: {str(e)}")
@@ -737,7 +975,9 @@ class TelegramBot:
         args = parts[2] if len(parts) > 2 else ""
         await self._exec_slash_command(update, f"/{skill_name} {args}".strip())
 
-    async def _handle_skill_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _handle_skill_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
         """Handle skill commands like /baoyu-post-to-x - forward to Claude Code CLI"""
         if not await self._check_access(update):
             return
@@ -758,8 +998,258 @@ class TelegramBot:
         log_debug(user_id, "command", text)
 
         await self._exec_slash_command(update, f"/{cmd_name} {args}".strip())
-    
-    async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    @staticmethod
+    def _resolve_voice_extension(mime_type: Optional[str]) -> str:
+        if not mime_type:
+            return "ogg"
+        normalized = mime_type.lower()
+        if "amr" in normalized:
+            return "amr"
+        if "mp3" in normalized or "mpeg" in normalized:
+            return "mp3"
+        if "wav" in normalized:
+            return "wav"
+        if "m4a" in normalized or "mp4" in normalized:
+            return "m4a"
+        return "ogg"
+
+    @staticmethod
+    def _build_voice_file_name(user_id: int, extension: str) -> str:
+        timestamp_ms = int(time.time() * 1000)
+        return f"{user_id}_{timestamp_ms}.{extension}"
+
+    def _get_whisper_transcriber(self) -> WhisperTranscriber:
+        if self._whisper_transcriber is None:
+            self._whisper_transcriber = WhisperTranscriber(
+                api_key=config.openai_api_key,
+                model=config.whisper_model,
+                base_url=config.openai_base_url,
+            )
+        return self._whisper_transcriber
+
+    async def _download_voice_file(self, voice, destination: FilePath) -> None:
+        telegram_file = await self.application.bot.get_file(voice.file_id)
+        logger.debug("Downloading voice file to %s", destination)
+        if hasattr(telegram_file, "download_to_drive"):
+            await telegram_file.download_to_drive(custom_path=str(destination))
+            return
+        if hasattr(self.application.bot, "download_file"):
+            await self.application.bot.download_file(
+                telegram_file.file_path, custom_path=str(destination)
+            )
+            return
+        raise RuntimeError("Telegram file download API is unavailable.")
+
+    async def _prepare_audio_for_whisper(
+        self, source_path: FilePath, cleanup_paths: List[FilePath]
+    ) -> FilePath:
+        detected_format = await self._audio_processor.detect_audio_format(source_path)
+        logger.debug("Detected voice format %s for %s", detected_format, source_path)
+
+        if detected_format == "mp3":
+            return source_path
+
+        if detected_format not in {"amr", "ogg"}:
+            return source_path
+
+        ffmpeg_ready = await self._audio_processor.check_ffmpeg_available()
+        if not ffmpeg_ready:
+            raise RuntimeError(
+                "ffmpeg is not installed. Install ffmpeg and retry voice message processing."
+            )
+
+        converted_path = source_path.with_suffix(".mp3")
+        cleanup_paths.append(converted_path)
+        converted = await self._audio_processor.convert_audio(
+            source_path, converted_path
+        )
+        return converted
+
+    async def _process_user_message_text(
+        self, update: Update, user_id: int, text: str
+    ) -> None:
+        current_session = await session_manager.get_session(user_id)
+        try:
+            await update.message.chat.send_action(action="typing")
+        except Exception:
+            pass
+
+        try:
+            new_session = current_session.pop("new_session", False)
+            if new_session:
+                await session_manager.update_session(user_id, current_session)
+
+            response = await project_chat_handler.process_message(
+                user_message=text,
+                user_id=user_id,
+                chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                session_id=self._effective_session_id(user_id, current_session),
+                model=current_session.get("model"),
+                new_session=new_session,
+                permission_callback=self._permission_callback,
+                typing_callback=lambda: update.message.chat.send_action(
+                    action="typing"
+                ),
+                bot=self.application.bot,
+            )
+            await self._save_session_id(user_id, response)
+            await self._reply_smart(
+                update.message,
+                response.content,
+                parse_mode="Markdown",
+                force_options=response.has_options,
+                streamed=response.streamed,
+            )
+        except asyncio.CancelledError:
+            # Task was cancelled by /stop command - silently exit
+            # The /stop handler will send the user response
+            logger.debug(f"Message processing cancelled for user {user_id}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in project chat: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Sorry, an error occurred while processing your message.\n"
+                f"Error: {str(e)}\n\n"
+                "Please try again later."
+            )
+
+    async def _handle_voice_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        del context
+        if not await self._check_access(update):
+            return
+        if not update.message or not update.message.voice:
+            return
+
+        user_id = update.effective_user.id
+        voice = update.message.voice
+        log_debug(user_id, "voice", f"voice:{voice.file_id} duration={voice.duration}")
+
+        async def run_task():
+            task = asyncio.current_task()
+            if task is not None:
+                self._track_voice_task(user_id, task)
+
+            self._audio_dir.mkdir(parents=True, exist_ok=True)
+            start = time.perf_counter()
+            cleanup_paths: List[FilePath] = []
+            outcome = "failed"
+
+            try:
+                if voice.duration and voice.duration > config.max_voice_duration:
+                    await update.message.reply_text(
+                        f"❌ Voice message is too long. Max duration is {config.max_voice_duration} seconds."
+                    )
+                    outcome = "duration_limit_exceeded"
+                    return
+
+                extension = self._resolve_voice_extension(
+                    getattr(voice, "mime_type", None)
+                )
+                file_name = self._build_voice_file_name(
+                    user_id=user_id, extension=extension
+                )
+                source_path = self._audio_dir / file_name
+                cleanup_paths.append(source_path)
+                logger.debug("Voice temp file path: %s", source_path)
+
+                try:
+                    await self._download_voice_file(voice, source_path)
+                except Exception as exc:
+                    logger.error(
+                        "Voice file download failed for user %s: %s",
+                        user_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    await update.message.reply_text(
+                        "❌ Failed to download your voice message. Please retry."
+                    )
+                    outcome = "download_failed"
+                    return
+
+                try:
+                    audio_path = await self._prepare_audio_for_whisper(
+                        source_path, cleanup_paths
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Voice conversion failed for user %s: %s",
+                        user_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    await update.message.reply_text(
+                        "❌ Failed to convert audio for transcription. "
+                        "Please ensure ffmpeg is installed and try again."
+                    )
+                    outcome = "conversion_failed"
+                    return
+
+                try:
+                    transcriber = self._get_whisper_transcriber()
+                except ValueError:
+                    await update.message.reply_text(
+                        "❌ Voice transcription is not configured. Please set OPENAI_API_KEY."
+                    )
+                    outcome = "missing_openai_key"
+                    return
+
+                try:
+                    text = await transcriber.transcribe_audio(
+                        audio_path, duration_seconds=voice.duration
+                    )
+                except EmptyTranscriptionError:
+                    await update.message.reply_text(
+                        "❌ No speech was detected in your voice message. Please try again."
+                    )
+                    outcome = "empty_transcription"
+                    return
+                except TranscriptionError as exc:
+                    logger.error(
+                        "Whisper transcription failed for user %s: %s", user_id, exc
+                    )
+                    await update.message.reply_text(
+                        "❌ Failed to transcribe your voice message. Please try again later."
+                    )
+                    outcome = "transcription_failed"
+                    return
+
+                preview = f"🎤 Voice: {text}"
+                await update.message.reply_text(preview)
+                await self._process_user_message_text(update, user_id, text)
+                outcome = "success"
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                logger.info("Voice processing cancelled for user %s", user_id)
+                raise
+            finally:
+                await self._audio_processor.cleanup_audio_files(cleanup_paths)
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                logger.info(
+                    "Voice processing result user_id=%s duration=%s outcome=%s elapsed_ms=%s",
+                    user_id,
+                    voice.duration,
+                    outcome,
+                    elapsed_ms,
+                )
+
+        async def on_overflow():
+            reply = (
+                f"⏳ Voice queue is full ({self._MAX_INFLIGHT_MESSAGES} active tasks). "
+                "Please wait or send /stop to terminate running tasks."
+            )
+            await update.message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+
+        await self._enqueue_user_task(user_id, run_task, on_overflow)
+
+    async def _handle_text_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
         """Handle text messages - use project chat or answer pending questions"""
         if not await self._check_access(update):
             return
@@ -817,39 +1307,7 @@ class TelegramBot:
             return
 
         async def run_task():
-            current_session = await session_manager.get_session(user_id)
-            try:
-                await update.message.chat.send_action(action="typing")
-            except Exception:
-                pass
-
-            try:
-                new_session = current_session.pop("new_session", False)
-                if new_session:
-                    await session_manager.update_session(user_id, current_session)
-
-                response = await project_chat_handler.process_message(
-                    user_message=text,
-                    user_id=user_id,
-                    chat_id=update.effective_chat.id,
-                    message_id=update.message.message_id,
-                    session_id=self._effective_session_id(user_id, current_session),
-                    model=current_session.get("model"),
-                    new_session=new_session,
-                    permission_callback=self._permission_callback,
-                    typing_callback=lambda: update.message.chat.send_action(action="typing"),
-                    bot=self.application.bot,
-                )
-                await self._save_session_id(user_id, response)
-                await self._reply_smart(update.message, response.content, parse_mode="Markdown", force_options=response.has_options, streamed=response.streamed)
-
-            except Exception as e:
-                logger.error(f"Error in project chat: {e}", exc_info=True)
-                await update.message.reply_text(
-                    "❌ Sorry, an error occurred while processing your message.\n"
-                    f"Error: {str(e)}\n\n"
-                    "Please try again later."
-                )
+            await self._process_user_message_text(update, user_id, text)
 
         async def on_overflow():
             reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
@@ -857,15 +1315,19 @@ class TelegramBot:
             log_debug(user_id, "bot", reply)
 
         await self._enqueue_user_task(user_id, run_task, on_overflow)
-    
+
     # Match both absolute (/foo/bar.png) and relative (foo/bar.png) file paths
-    _FILE_PATH_RE = re.compile(r'(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:png|jpg|jpeg|gif|webp|mp4|mp3|pdf|zip))', re.IGNORECASE)
-    _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-    _OPTION_RE = re.compile(r'^\s*(\d+)[.、)）]\s*(.+)', re.MULTILINE)
+    _FILE_PATH_RE = re.compile(
+        r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:png|jpg|jpeg|gif|webp|mp4|mp3|pdf|zip))",
+        re.IGNORECASE,
+    )
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+    _OPTION_RE = re.compile(r"^\s*(\d+)[.、)）]\s*(.+)", re.MULTILINE)
 
     def _resolve_paths(self, content: str) -> List[FilePath]:
         """Extract file paths from text and resolve relative ones against PROJECT_ROOT."""
         from telegram_bot.core.project_chat import PROJECT_ROOT
+
         paths = []
         seen = set()
         for m in self._FILE_PATH_RE.findall(content):
@@ -878,7 +1340,9 @@ class TelegramBot:
                 paths.append(p)
         return paths
 
-    def _split_paths_by_scope(self, paths: List[FilePath]) -> Tuple[List[FilePath], List[FilePath]]:
+    def _split_paths_by_scope(
+        self, paths: List[FilePath]
+    ) -> Tuple[List[FilePath], List[FilePath]]:
         in_root: List[FilePath] = []
         outside: List[FilePath] = []
         for path in paths:
@@ -899,7 +1363,9 @@ class TelegramBot:
             return []
         return [m[1].strip() for m in matches]
 
-    def _build_option_keyboard(self, options: List[str]) -> Optional[InlineKeyboardMarkup]:
+    def _build_option_keyboard(
+        self, options: List[str]
+    ) -> Optional[InlineKeyboardMarkup]:
         """Build inline keyboard from extracted options."""
         if not options:
             return None
@@ -908,7 +1374,7 @@ class TelegramBot:
             # callback_data max 64 bytes; truncate label if needed
             label = f"{i}. {opt}"
             cb_data = f"opt:{label}"
-            if len(cb_data.encode('utf-8')) > 64:
+            if len(cb_data.encode("utf-8")) > 64:
                 cb_data = f"opt:{i}"
             buttons.append([InlineKeyboardButton(label, callback_data=cb_data)])
         return InlineKeyboardMarkup(buttons)
@@ -926,13 +1392,19 @@ class TelegramBot:
             except Exception as e:
                 logger.warning(f"Failed to send file {p}: {e}")
 
-    async def _prompt_outside_file_confirmation(self, chat_id: int, user_id: int, paths: List[FilePath]) -> None:
+    async def _prompt_outside_file_confirmation(
+        self, chat_id: int, user_id: int, paths: List[FilePath]
+    ) -> None:
         session = await session_manager.get_session(user_id)
         session["pending_external_files"] = [str(p) for p in paths]
         await session_manager.update_session(user_id, session)
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("✅ Send external files", callback_data="extsend:allow")],
+                [
+                    InlineKeyboardButton(
+                        "✅ Send external files", callback_data="extsend:allow"
+                    )
+                ],
                 [InlineKeyboardButton("❌ Cancel", callback_data="extsend:deny")],
             ]
         )
@@ -966,7 +1438,14 @@ class TelegramBot:
             chunks.append(remaining)
         return chunks
 
-    async def _reply_smart(self, message, content: str, parse_mode: str = "Markdown", force_options: bool = False, streamed: bool = False):
+    async def _reply_smart(
+        self,
+        message,
+        content: str,
+        parse_mode: str = "Markdown",
+        force_options: bool = False,
+        streamed: bool = False,
+    ):
         """Reply with text (splitting if needed), send referenced files, and add option buttons."""
         # Skip text sending if already streamed
         if not streamed:
@@ -988,7 +1467,14 @@ class TelegramBot:
             if kb:
                 await message.reply_text("Please select:", reply_markup=kb)
 
-    async def _send_smart(self, chat_id: int, content: str, user_id: Optional[int] = None, force_options: bool = False, streamed: bool = False):
+    async def _send_smart(
+        self,
+        chat_id: int,
+        content: str,
+        user_id: Optional[int] = None,
+        force_options: bool = False,
+        streamed: bool = False,
+    ):
         """Send text to chat_id (splitting if needed) with file and option detection."""
         bot = self.application.bot
 
@@ -1010,7 +1496,9 @@ class TelegramBot:
             if kb:
                 await bot.send_message(chat_id, "Please select:", reply_markup=kb)
 
-    async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _handle_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
         """Handle callback queries from inline keyboards"""
         if not await self._check_access(update):
             return
@@ -1041,13 +1529,17 @@ class TelegramBot:
                 p = FilePath(raw)
                 try:
                     resolved = p.resolve(strict=False)
-                    if resolved.is_file() and resolved.stat().st_size < 10 * 1024 * 1024:
+                    if (
+                        resolved.is_file()
+                        and resolved.stat().st_size < 10 * 1024 * 1024
+                    ):
                         paths.append(resolved)
                 except Exception:
                     continue
             await self._send_file_paths(update.effective_chat.id, paths)
             return
 
+        # Handle permission request buttons
         # Handle numbered option buttons (from Claude's text-based choices)
         if data.startswith("opt:"):
             choice = data.split(":", 1)[1]
@@ -1067,14 +1559,24 @@ class TelegramBot:
                         session_id=self._effective_session_id(user_id, session),
                         model=session.get("model"),
                         permission_callback=self._permission_callback,
-                        typing_callback=lambda: self.application.bot.send_chat_action(chat_id, action="typing"),
+                        typing_callback=lambda: self.application.bot.send_chat_action(
+                            chat_id, action="typing"
+                        ),
                         bot=self.application.bot,
                     )
                     await self._save_session_id(user_id, response)
-                    await self._send_smart(chat_id, response.content, user_id=user_id, force_options=response.has_options, streamed=response.streamed)
+                    await self._send_smart(
+                        chat_id,
+                        response.content,
+                        user_id=user_id,
+                        force_options=response.has_options,
+                        streamed=response.streamed,
+                    )
                 except Exception as e:
                     logger.error(f"Option reply failed: {e}", exc_info=True)
-                    await self.application.bot.send_message(chat_id, f"❌ Processing failed: {e}")
+                    await self.application.bot.send_message(
+                        chat_id, f"❌ Processing failed: {e}"
+                    )
 
             async def on_overflow():
                 await self.application.bot.send_message(
@@ -1093,7 +1595,9 @@ class TelegramBot:
             session["model"] = model_name
             await session_manager.update_session(user_id, session)
             label = dict(self.MODELS).get(model_name, model_name)
-            logger.info(f"User {user_id}: model set to {model_name!r} via inline keyboard")
+            logger.info(
+                f"User {user_id}: model set to {model_name!r} via inline keyboard"
+            )
             reply = f"✅ Model switched to: {label}"
             await query.edit_message_text(reply)
             log_debug(user_id, "bot", reply)
@@ -1103,17 +1607,16 @@ class TelegramBot:
         pending = await session_manager.get_pending_question(user_id)
         if pending:
             await session_manager.clear_pending_question(user_id)
-            await query.edit_message_text(
-                f"✅ Selected: {data}\n\nContinuing..."
-            )
-    
+            await query.edit_message_text(f"✅ Selected: {data}\n\nContinuing...")
+
     async def _set_bot_commands(self):
         """Set bot commands menu"""
         commands = [
             BotCommand("new", "Start a new Claude Code session"),
-            BotCommand("stop", "Terminate the current task"),
+            BotCommand("stop", "Interrupt execution immediately"),
             BotCommand("model", "Switch Claude Code model"),
             BotCommand("resume", "Resume a previous session"),
+            BotCommand("history", "View recent conversation history"),
             BotCommand("skills", "View available skills"),
             BotCommand("skill", "Execute a Claude Code skill"),
             BotCommand("command", "Execute a Claude Code command"),
@@ -1125,5 +1628,6 @@ class TelegramBot:
         ):
             await self.application.bot.set_my_commands(commands, scope=scope)
         logger.info("Bot commands set")
+
 
 bot = TelegramBot()

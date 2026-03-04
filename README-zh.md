@@ -19,12 +19,15 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 - 远程调用任何 Claude Code 技能 (`/skill <name>`) 或斜杠命令 (`/command <cmd>`)
 - 通过 `/model` 在 Sonnet、Opus、Haiku 之间随时切换
 - 使用 `/resume` 恢复历史对话，浏览会话记录
+- 使用 `/history` 查看最近对话历史 — 显示当前会话最近 5 条消息
 
 **智能交互**
 - 渐进式流式响应：AI 回复实时更新，边思考边显示，而非等待完成后才展示
 - Claude 输出的编号选项自动转为 Telegram 内联按钮 — 点击即选
 - 响应中的文件路径（图片、PDF 等）自动作为照片或文档发送
+- 原生语音消息支持：自动下载、格式识别/转码（OGG/AMR → MP3）、Whisper 转写后继续交给 Claude 处理
 - 每用户独立的 SDK 长连接 — 低延迟，支持并发消息（每用户最多 3 条）
+- 优先级 `/stop` 命令：立即取消正在运行的任务和语音转写，即使消息队列已满
 
 **安全**
 - 项目目录内的文件访问自动放行
@@ -43,6 +46,8 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 - **Python 3.11+**
 - **Claude CLI** — 已安装并在 `$PATH` 中，或通过 `CLAUDE_CLI_PATH` 指定
 - **Telegram Bot Token** — 从 [@BotFather](https://t.me/BotFather) 获取
+- **ffmpeg** — 语音格式转换必需
+- **OpenAI API Key** — Whisper 转写必需（`OPENAI_API_KEY`）
 
 ## 快速开始
 
@@ -112,6 +117,14 @@ Claude:  找到问题了，在 src/auth/validator.ts:42 — 正则没有转义 +
 Claude:  已创建提交: fix(auth): escape special characters in email validation
 ```
 
+### 发送语音消息
+
+```
+你：     [发送 Telegram 语音消息]
+Bot:     🎤 Voice: summarize yesterday's git diff
+Claude:  下面是昨天代码变更的摘要...
+```
+
 ### 恢复昨天的工作
 
 ```
@@ -126,6 +139,25 @@ Bot:     已切换到会话: 重构 auth 模块
 你：     我们上次做到哪了？
 Claude:  我们已经把 JWT 逻辑抽离到了独立的 service。
          还剩下：更新 middleware 使用新 service...
+```
+
+### 查看最近对话历史
+
+```
+你：     /history
+Bot:     📜 Recent History (last 5 messages)
+
+         🧑 User [2026-03-05 14:23:15]
+         修复登录 bug
+
+         🤖 Assistant [2026-03-05 14:23:18]
+         找到问题了，在 src/auth/validator.ts:42...
+
+         🧑 User [2026-03-05 14:25:30]
+         给这个加个测试
+
+         🤖 Assistant [2026-03-05 14:25:35]
+         已在 tests/auth.test.ts 添加测试...
 ```
 
 ### 对话中切换模型
@@ -160,7 +192,7 @@ Claude:  ...
 | `/new` | 开启新会话（清除当前连接并取消正在进行的流式响应） |
 | `/model` | 切换模型（Sonnet / Opus / Haiku） |
 | `/resume` | 浏览并恢复历史会话（显示进度摘要及最后一条助手消息） |
-| `/stop` | 终止当前运行的任务 |
+| `/stop` | 立即中断执行（绕过队列限制，取消活动任务） |
 | `/skills` | 列出可用的 Claude Code 技能 |
 | `/skill <name> [args]` | 执行技能命令 |
 | `/command <cmd> [args]` | 执行 Claude Code 斜杠命令 |
@@ -178,8 +210,32 @@ Claude:  ...
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
 | `DRAFT_UPDATE_MIN_CHARS` | 否 | `150` | 流式响应草稿更新的最小字符数 |
 | `DRAFT_UPDATE_INTERVAL` | 否 | `1.0` | 流式响应草稿更新的最小间隔（秒） |
+| `OPENAI_API_KEY` | 语音功能必需 | — | Whisper 转写所需 OpenAI API Key |
+| `OPENAI_BASE_URL` | 否 | *（官方 OpenAI API）* | OpenAI 兼容 Whisper 接口基础地址 |
+| `WHISPER_MODEL` | 否 | `whisper-1` | Whisper 模型名称 |
+| `MAX_VOICE_DURATION` | 否 | `300` | 允许的最大语音时长（秒） |
+| `FFMPEG_PATH` | 否 | *（自动检测）* | ffmpeg 二进制绝对路径 |
 | `LOG_LEVEL` | 否 | `INFO` | 日志级别 |
 | `PROXY_URL` | 否 | — | HTTP 代理；自动配置 `http_proxy`/`https_proxy`/`all_proxy` |
+
+## ffmpeg 安装
+
+启用语音消息前请先安装 ffmpeg：
+
+- macOS (Homebrew): `brew install ffmpeg`
+- Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
+- Windows (winget): `winget install --id Gyan.FFmpeg -e`
+
+安装后可验证：
+
+```bash
+ffmpeg -version
+```
+
+## Whisper 成本说明
+
+语音转写使用 OpenAI Whisper API（`whisper-1`），按音频时长计费。
+参考价格约为 **$0.006/分钟**，请以 OpenAI 最新价格页面为准。
 
 ## 安全
 

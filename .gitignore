@@ -42,3 +42,4 @@ logs/
 .doc_hash
 openspec
 .ace-tool/
+/.codex

@@ -19,12 +19,15 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - Invoke any Claude Code skill (`/skill <name>`) or slash command (`/command <cmd>`) remotely
 - Switch between Sonnet, Opus, and Haiku on the fly via `/model`
 - Resume previous conversations with `/resume` and browse session history
+- View recent conversation history with `/history` — displays last 5 messages from current session
 
 **Smart Interaction**
 - Progressive streaming: AI responses update in real-time as Claude thinks, not after completion
 - Claude's numbered options auto-convert to Telegram inline keyboard buttons — just tap to choose
 - File paths (images, PDFs, etc.) in Claude's responses are automatically sent as photos or documents
+- Native Telegram voice messages: auto-download, format detection/conversion (OGG/AMR → MP3), Whisper transcription, then forwarded to Claude
 - Per-user dedicated SDK streams — low latency, concurrent message support (up to 3 per user)
+- Priority `/stop` command: immediately cancels running tasks and voice transcription, even when message queue is full
 
 **Security**
 - File access inside the project directory is auto-allowed
@@ -43,6 +46,8 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - **Python 3.11+**
 - **Claude CLI** — installed and in `$PATH`, or specify via `CLAUDE_CLI_PATH`
 - **Telegram Bot Token** — from [@BotFather](https://t.me/BotFather)
+- **ffmpeg** — required for audio format conversion
+- **OpenAI API Key** — required for Whisper transcription (`OPENAI_API_KEY`)
 
 ## Quick Start
 
@@ -112,6 +117,14 @@ You:   /skill commit
 Claude: Created commit: fix(auth): escape special characters in email validation
 ```
 
+### Send a voice message
+
+```
+You:   [send Telegram voice message]
+Bot:   🎤 Voice: summarize yesterday's git diff
+Claude: Here is a summary of yesterday's changes...
+```
+
 ### Resume yesterday's work
 
 ```
@@ -119,6 +132,28 @@ You:   /resume
 Bot:   1. Refactoring auth module — 2 hours ago
        2. Adding dark mode — yesterday
        3. API rate limiting — 3 days ago
+You:   1
+Claude: Resuming session... [continues from where you left off]
+```
+
+### Check recent conversation history
+
+```
+You:   /history
+Bot:   📜 Recent History (last 5 messages)
+
+       🧑 User [2026-03-05 14:23:15]
+       fix the login bug
+
+       🤖 Assistant [2026-03-05 14:23:18]
+       I found the issue in src/auth/validator.ts:42...
+
+       🧑 User [2026-03-05 14:25:30]
+       add a test for this
+
+       🤖 Assistant [2026-03-05 14:25:35]
+       Added test in tests/auth.test.ts...
+```
 
 You:   1
 Bot:   Switched to session: Refactoring auth module
@@ -160,7 +195,7 @@ Claude: ...
 | `/new` | Start a new session (clears current stream and cancels ongoing streaming) |
 | `/model` | Switch model (Sonnet / Opus / Haiku) |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
-| `/stop` | Terminate the current running task |
+| `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
 | `/skills` | List available Claude Code skills |
 | `/skill <name> [args]` | Execute a skill command |
 | `/command <cmd> [args]` | Execute a Claude Code slash command |
@@ -178,8 +213,32 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |
 | `DRAFT_UPDATE_INTERVAL` | No | `1.0` | Minimum seconds between streaming draft updates |
+| `OPENAI_API_KEY` | Voice only | — | OpenAI API key for Whisper transcription |
+| `OPENAI_BASE_URL` | No | *(official OpenAI API)* | OpenAI-compatible Whisper endpoint base URL |
+| `WHISPER_MODEL` | No | `whisper-1` | Whisper model name |
+| `MAX_VOICE_DURATION` | No | `300` | Max accepted voice duration in seconds |
+| `FFMPEG_PATH` | No | *(auto-detect)* | Absolute path to ffmpeg binary |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `PROXY_URL` | No | — | HTTP proxy; auto-configures `http_proxy`/`https_proxy`/`all_proxy` |
+
+## ffmpeg Installation
+
+Install ffmpeg before enabling voice messages:
+
+- macOS (Homebrew): `brew install ffmpeg`
+- Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
+- Windows (winget): `winget install --id Gyan.FFmpeg -e`
+
+Then verify:
+
+```bash
+ffmpeg -version
+```
+
+## Whisper Cost Notes
+
+Voice transcription uses OpenAI Whisper API (`whisper-1`) and incurs usage-based charges.
+Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pricing for latest values.
 
 ## Security
 

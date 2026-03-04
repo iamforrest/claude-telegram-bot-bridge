@@ -1,30 +1,20 @@
+# ruff: noqa: E402
+
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
 import sys
 import types
+from telegram.error import TelegramError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-telegram_module = types.ModuleType("telegram")
-telegram_module.Bot = object
-telegram_error_module = types.ModuleType("telegram.error")
-
-
-class _TelegramError(Exception):
-    pass
-
-
-telegram_error_module.TelegramError = _TelegramError
-sys.modules.setdefault("telegram", telegram_module)
-sys.modules.setdefault("telegram.error", telegram_error_module)
 
 config_module = types.ModuleType("telegram_bot.utils.config")
 config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
     draft_update_interval=0.1,
 )
-sys.modules.setdefault("telegram_bot.utils.config", config_module)
+sys.modules["telegram_bot.utils.config"] = config_module
 
 from telegram_bot.core.streaming import StreamingMessageHandler
 
@@ -33,8 +23,8 @@ class _BotWithDraftId:
     def __init__(self):
         self.calls = []
 
-    async def send_message_draft(self, *, chat_id, draft_id, text):
-        self.calls.append(("send_message_draft", chat_id, draft_id, text))
+    async def send_message(self, *, chat_id, text):
+        self.calls.append(("send_message", chat_id, text))
         return SimpleNamespace(message_id=101)
 
 
@@ -67,7 +57,7 @@ class _BotDraftReturnsBool:
 
 class _BotEditNotModified:
     async def edit_message_text(self, *, chat_id, message_id, text):
-        raise _TelegramError(
+        raise TelegramError(
             "Message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
         )
 
@@ -81,9 +71,9 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(draft)
         self.assertEqual(draft.message_id, 101)
-        self.assertIsNotNone(draft.draft_id)
+        self.assertIsNone(draft.draft_id)
         self.assertEqual(len(bot.calls), 1)
-        self.assertEqual(bot.calls[0][0], "send_message_draft")
+        self.assertEqual(bot.calls[0][0], "send_message")
 
     async def test_create_draft_falls_back_to_send_message_on_signature_mismatch(self):
         bot = _BotDraftSignatureMismatch()
@@ -97,7 +87,7 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bot.calls), 1)
         self.assertEqual(bot.calls[0][0], "send_message")
 
-    async def test_create_draft_falls_back_when_draft_api_returns_bool(self):
+    async def test_create_draft_uses_send_message_even_if_draft_api_exists(self):
         bot = _BotDraftReturnsBool()
         handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
 
@@ -106,9 +96,8 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(draft)
         self.assertEqual(draft.message_id, 303)
         self.assertIsNone(draft.draft_id)
-        self.assertEqual(len(bot.calls), 2)
-        self.assertEqual(bot.calls[0][0], "send_message_draft")
-        self.assertEqual(bot.calls[1][0], "send_message")
+        self.assertEqual(len(bot.calls), 1)
+        self.assertEqual(bot.calls[0][0], "send_message")
 
     async def test_update_draft_treats_not_modified_as_success(self):
         bot = _BotEditNotModified()

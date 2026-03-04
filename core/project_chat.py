@@ -516,10 +516,16 @@ class ProjectChatHandler:
             return await asyncio.wait_for(future, timeout=PROCESS_TIMEOUT)
 
         except asyncio.CancelledError:
-            logger.info(f"Task cancelled for user {user_id}")
+            logger.info(f"Task cancelled for user {user_id} - cleaning up")
+            # Clean up streaming drafts if active
+            if streaming_handler:
+                try:
+                    await streaming_handler.cancel()
+                except Exception as e:
+                    logger.error(f"Failed to cancel streaming handler: {e}")
             await self.stop(user_id)
-            msg = "🛑 Task has been terminated."
-            return ChatResponse(content=msg, success=False, error=msg)
+            # Don't return a message - bot.py will handle the user response
+            raise
 
         except asyncio.TimeoutError:
             logger.warning(f"Query timed out for user {user_id} after {PROCESS_TIMEOUT}s")
@@ -620,6 +626,56 @@ class ProjectChatHandler:
             return last_text
         except Exception:
             return None
+
+    def get_recent_messages(self, session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Get the last N messages from a session in chronological order."""
+        filepath = CONVERSATIONS_DIR / f"{session_id}.jsonl"
+        if not filepath.exists():
+            return []
+
+        try:
+            all_messages = []
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = d.get("type")
+                    if msg_type not in ("user", "assistant"):
+                        continue
+
+                    msg = d.get("message", {})
+                    role = msg.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+
+                    content = msg.get("content", "")
+                    text = ""
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text = block.get("text", "").strip()
+                                if text:
+                                    break
+                    elif isinstance(content, str):
+                        text = content.strip()
+
+                    if not text:
+                        continue
+
+                    timestamp = d.get("timestamp", "")
+                    all_messages.append({
+                        "role": role,
+                        "content": text,
+                        "timestamp": timestamp
+                    })
+
+            return all_messages[-limit:] if all_messages else []
+        except Exception as e:
+            logger.error(f"Error reading session messages: {e}")
+            return []
 
     @staticmethod
     def _extract_first_user_message(filepath: Path) -> Optional[str]:

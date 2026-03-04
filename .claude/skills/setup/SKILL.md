@@ -18,7 +18,8 @@ This skill guides users through installing the Telegram Skill Bot in their prefe
 4. Collects optional configuration (user whitelist, proxy)
 5. Creates virtual environment and installs dependencies
 6. Saves configuration to .env file
-7. Provides next steps in the user's language
+7. Optionally configures voice message transcription (OpenAI Whisper)
+8. Provides next steps in the user's language
 
 ## Usage
 
@@ -96,22 +97,38 @@ md5 -q requirements.txt > venv/.req_hash
 
 ### Step 7: Save Configuration
 
-Create `.env` file with the collected information:
+Create `.env` file based on `.env.example` template with the collected information:
 
-```bash
-# Telegram Skill Bot Environment Configuration
+1. Read `.env.example` as the base template
+2. Replace the following values with user-provided configuration:
+   - `TELEGRAM_BOT_TOKEN=your_bot_token_here` → user's actual token
+   - `# ALLOWED_USER_IDS=123456789,987654321` → uncomment and set if user provided IDs
+   - `# PROXY_URL=http://127.0.0.1:7890` → uncomment and set if user provided proxy
 
-# Required: Get your bot token from @BotFather (https://t.me/BotFather)
-TELEGRAM_BOT_TOKEN=<user_token>
+3. Keep all other configuration options from `.env.example` as commented defaults
+4. This ensures users have a complete reference of all available options
 
-# Optional: Comma-separated list of allowed Telegram user IDs
-ALLOWED_USER_IDS=<user_ids>
+The generated `.env` should maintain the same structure and comments as `.env.example`, only activating the options the user explicitly configured.
 
-# Optional: HTTP proxy URL
-PROXY_URL=<proxy_url>
-```
+### Step 8: Optional Voice Message Support
 
-### Step 8: Completion
+After saving the basic configuration, ask the user if they want to enable voice message transcription:
+
+**Voice Message Support (Optional):**
+- Explain that the bot can transcribe voice messages using OpenAI Whisper API
+- If the user wants this feature, collect:
+  - `OPENAI_API_KEY`: Required for Whisper API access
+  - `OPENAI_BASE_URL`: Optional, for OpenAI-compatible endpoints (default: OpenAI official)
+  - `WHISPER_MODEL`: Optional, model name (default: `whisper-1`)
+  - `MAX_VOICE_DURATION`: Optional, max duration in seconds (default: 300)
+
+If the user chooses to enable voice support, update the `.env` file by uncommenting and setting these variables:
+- Uncomment `# OPENAI_API_KEY=sk-...` and set the actual API key
+- Optionally uncomment and set `OPENAI_BASE_URL`, `WHISPER_MODEL`, `MAX_VOICE_DURATION` if user provides custom values
+
+Note: All voice-related configuration options are already present in `.env` as commented defaults from Step 7.
+
+### Step 9: Completion
 
 Inform the user in their language that installation is complete. Provide next steps:
 
@@ -129,6 +146,7 @@ Inform the user in their language that installation is complete. Provide next st
 3. Verify in Telegram:
    - Open Telegram and find your bot
    - Send `/start` to begin chatting with Claude
+   - If voice support is enabled, try sending a voice message
 
 ## Error Handling
 

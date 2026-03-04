@@ -37,7 +37,7 @@ python -m telegram_bot --path /absolute/path/to/project --debug
 ./start.sh --path /path --uninstall
 ```
 
-No test suite exists yet.
+Tests use Python `unittest` under `tests/`.
 
 ## Architecture
 
@@ -54,6 +54,12 @@ core/project_chat.py ProjectChatHandler — per-user long-lived Claude SDK
 core/streaming.py    StreamingMessageHandler — progressive draft message updates
     │                for real-time AI response streaming
     │
+utils/audio_processor.py AudioProcessor — format detection, ffmpeg conversion,
+    │                   temp/stale audio cleanup
+    │
+utils/transcription.py WhisperTranscriber — OpenAI Whisper calls, retry/backoff,
+    │                  empty-text validation, cost/duration logging
+    │
 session/             SessionManager/SessionStore — per-user state in JSON
     │                (PROJECT_ROOT/.telegram_bot/sessions.json)
     │
@@ -64,17 +70,23 @@ utils/chat_logger.py Per-session debug chat logging
 ### Key data flows
 
 - **User message** → `TelegramBot` handler → access check → `ProjectChatHandler.process_message()` → Claude SDK stream → response back to Telegram
-- **Permission gating**: Tool requests pass through `_permission_callback()` in bot.py. File access inside `PROJECT_ROOT` is auto-allowed; outside requires user confirmation via Telegram inline buttons.
+- **Voice message** → `TelegramBot._handle_voice_message()` → download → format detect/convert → Whisper transcription → `🎤 Voice:` preview → same `process_message()` flow as text
+- **Permission gating**: Tool requests pass through `_permission_callback()` in bot.py. File access inside `PROJECT_ROOT` is auto-allowed; outside requires user confirmation via Telegram inline buttons with three options: Allow (once), Deny, or Allow All (session-wide). User responses are handled via asyncio.Future pattern with 60-second timeout.
 - **Per-user streams**: Each user gets a persistent `ClaudeSDKClient` connection in `ProjectChatHandler._streams`. Streams are reused across messages and cleared on `/new` or model change.
 - **Session state**: Three layers — Telegram-side (SessionStore JSON), SDK-side (~/.claude/projects/{name}/*.jsonl), runtime tracking (_runtime_active_sessions dict).
 
 ### Important patterns
 
 - **Progressive streaming**: AI responses are streamed in real-time using Telegram draft messages. Text updates every 150 characters or 1 second. Long messages (>4000 chars) automatically split into multiple drafts.
+- **Priority stop command**: `/stop` has priority handling - it bypasses the message queue limit and immediately cancels the currently executing task via `asyncio.Task.cancel()`. This allows users to interrupt runaway executions even when the queue is full.
 - **Streaming interruption**: `/stop` and `/new` commands immediately cancel ongoing streaming and delete draft messages. Other commands (`/model`, `/resume`, `/skills`) do not interrupt streaming.
+- **Voice interruption**: `/stop` and `/new` cancel active voice transcription tasks and clean temporary audio files.
+- **Task cancellation flow**: When `/stop` is invoked, it cancels the active task stored in `_active_tasks[user_id]`. The cancelled task raises `asyncio.CancelledError` in `ProjectChatHandler.process_message()`, which triggers cleanup (delete drafts, stop SDK stream) before returning.
+- **Permission request UI**: When tools need to access paths outside PROJECT_ROOT, a standalone message with inline keyboard buttons is sent. Users can Allow (once), Deny, or Allow All (session-wide). Requests timeout after 60 seconds. The `/new` command clears the approve-all flag.
+- **Permission callback pattern**: Uses asyncio.Future to wait for user response. Callback data format: `perm:allow:{request_id}`, `perm:deny:{request_id}`, `perm:allow_all:{request_id}`. Futures are stored in `_pending_permission_futures` dict and resolved by callback handlers.
 - `AskUserQuestion` tool is degraded: converted to plain text with numbered options rendered as Telegram inline keyboard buttons.
 - Responses with file paths matching media extensions are auto-sent as Telegram photos/documents.
-- Message queue per user: max 3 concurrent tasks with overflow rejection.
+- Message queue per user: max 3 concurrent tasks with overflow rejection. Priority commands like `/stop` bypass this limit.
 - `start.sh` handles venv creation, dependency caching (MD5-based), log rotation (14 days), auto-restart with crash detection (>5 in 60s).
 
 ## Key environment variables
@@ -89,6 +101,11 @@ utils/chat_logger.py Per-session debug chat logging
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
 | `DRAFT_UPDATE_MIN_CHARS` | No | Min characters before draft update (default: 150) |
 | `DRAFT_UPDATE_INTERVAL` | No | Min seconds between draft updates (default: 1.0) |
+| `OPENAI_API_KEY` | Voice only | API key for Whisper transcription |
+| `OPENAI_BASE_URL` | No | Optional OpenAI-compatible Whisper API base URL |
+| `WHISPER_MODEL` | No | Whisper model name (default: `whisper-1`) |
+| `MAX_VOICE_DURATION` | No | Max accepted voice duration in seconds (default: 300) |
+| `FFMPEG_PATH` | No | Optional absolute ffmpeg path |
 
 ## Runtime directories
 
