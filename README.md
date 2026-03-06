@@ -296,3 +296,7 @@ Enables full console logging, per-session chat logs, and SDK tool call tracing.
 ## License
 
 MIT
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=terranc/claude-telegram-bot-bridge&type=Date)](https://star-history.com/#terranc/claude-telegram-bot-bridge&Date)
