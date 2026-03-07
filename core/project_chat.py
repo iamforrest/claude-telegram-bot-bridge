@@ -222,26 +222,26 @@ class ProjectChatHandler:
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
 
+        # NOTE: append_system_prompt is passed as a CLI argument.  On Windows
+        # the .CMD launcher runs via cmd.exe which breaks on literal newlines
+        # inside arguments, causing the SDK initialisation to hang.  Keep the
+        # prompt as a single line (spaces only).
+        _ask_prompt = (
+            "## Important: User Questions and Choices. "
+            "The AskUserQuestion tool is NOT available in this environment. "
+            "When you need to ask the user a question with multiple choice options: "
+            "1) Output the question and context clearly; "
+            "2) List options with numbers (1., 2., 3., etc.); "
+            "3) STOP and WAIT for the user's response; "
+            "4) Do NOT continue execution or make assumptions; "
+            "5) Do NOT try to use AskUserQuestion tool. "
+            "After outputting options, you MUST stop and wait for user input."
+        )
         opts: Dict[str, Any] = {
             "cwd": str(self.get_user_cwd(user_id)),
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": ["AskUserQuestion"],  # Disable to force degradation
-            "append_system_prompt": (
-                "\n\n## Important: User Questions and Choices\n\n"
-                "The AskUserQuestion tool is NOT available in this environment. "
-                "When you need to ask the user a question with multiple choice options:\n\n"
-                "1. Output the question and context clearly\n"
-                "2. List options with numbers (1., 2., 3., etc.)\n"
-                "3. STOP and WAIT for the user's response\n"
-                "4. Do NOT continue execution or make assumptions\n"
-                "5. Do NOT try to use AskUserQuestion tool\n\n"
-                "Example format:\n"
-                "Question: Which option do you prefer?\n\n"
-                "1. Option A - Description\n"
-                "2. Option B - Description\n"
-                "3. Option C - Description\n\n"
-                "After outputting options, you MUST stop and wait for user input."
-            ),
+            "append_system_prompt": _ask_prompt,
             "can_use_tool": can_use_tool,
             "permission_mode": "default",
         }

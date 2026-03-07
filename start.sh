@@ -471,34 +471,15 @@ load_optional_env() {
         echo "🌐 Proxy configured: $proxy_url"
     fi
 
-    # Auto-detect Git Bash path on Windows when not already set
+    # Auto-detect Git Bash path on Windows when not already set.
+    # NOTE: Primary detection is done in Python (__main__.py) using pathlib which
+    # handles Windows backslash paths correctly. The bash-side detection here is
+    # only a fallback for when .env has an explicit value.
     if [ -z "$CLAUDE_CODE_GIT_BASH_PATH" ]; then
         local git_bash_path
         git_bash_path="$(read_env_with_fallback "CLAUDE_CODE_GIT_BASH_PATH")"
         if [ -n "$git_bash_path" ]; then
             export CLAUDE_CODE_GIT_BASH_PATH="$git_bash_path"
-        elif command -v cygpath &>/dev/null; then
-            # Convert current bash executable to Windows path (works in Git Bash / MSYS2)
-            local detected
-            detected="$(cygpath -w "$(which bash)" 2>/dev/null || true)"
-            if [ -n "$detected" ]; then
-                export CLAUDE_CODE_GIT_BASH_PATH="$detected"
-            fi
-        fi
-        # Fallback: common Windows Git installation paths
-        if [ -z "$CLAUDE_CODE_GIT_BASH_PATH" ]; then
-            local candidates=(
-                "/c/Program Files/Git/bin/bash.exe"
-                "/c/Program Files (x86)/Git/bin/bash.exe"
-                "/d/Program Files/Git/bin/bash.exe"
-                "/d/Git/bin/bash.exe"
-            )
-            for candidate in "${candidates[@]}"; do
-                if [ -f "$candidate" ]; then
-                    export CLAUDE_CODE_GIT_BASH_PATH="$(cygpath -w "$candidate" 2>/dev/null || echo "$candidate")"
-                    break
-                fi
-            done
         fi
     fi
 }
