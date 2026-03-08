@@ -134,7 +134,8 @@ sys.modules["claude_code_sdk.types"] = permission_module
 
 import telegram_bot.core.bot as bot_module
 from telegram_bot.core.bot import TelegramBot
-from telegram_bot.utils.transcription import EmptyTranscriptionError
+from telegram_bot.utils.tos_uploader import TOSUploadError
+from telegram_bot.utils.transcription import EmptyTranscriptionError, TranscriptionError
 
 _NOISY_LOGGERS = ["telegram_bot.core.bot"]
 _ORIGINAL_LEVELS = {}
@@ -342,10 +343,13 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda path, cleanup: path
         )
         bot._process_user_message_text = AsyncMock()
+        uploaded = SimpleNamespace(
+            signed_url="https://tos.example.com/stage/voice.ogg?X-Tos-Signature=abc",
+            object_key="telegram-voice/11/object.ogg",
+        )
         uploader = SimpleNamespace(
-            upload_file=MagicMock(
-                return_value="https://tos.example.com/stage/voice.ogg?X-Tos-Signature=abc"
-            ),
+            upload_file_with_object_key=MagicMock(return_value=uploaded),
+            delete_object=MagicMock(return_value=None),
             redact_signed_url=lambda url: (
                 "https://tos.example.com/stage/voice.ogg?***REDACTED***"
             ),
@@ -367,11 +371,12 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
             bot_module.config.transcription_provider = old_provider
 
         bot._download_voice_file.assert_awaited_once()
-        self.assertEqual(uploader.upload_file.call_count, 1)
+        self.assertEqual(uploader.upload_file_with_object_key.call_count, 1)
         transcriber.transcribe_audio.assert_awaited_once_with(
             "https://tos.example.com/stage/voice.ogg?X-Tos-Signature=abc",
             duration_seconds=30,
         )
+        uploader.delete_object.assert_called_once_with("telegram-voice/11/object.ogg")
         bot._prepare_audio_for_whisper.assert_not_called()
         bot._process_user_message_text.assert_awaited_once()
         called = bot._process_user_message_text.await_args
@@ -379,6 +384,110 @@ class VoiceFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             called.kwargs.get("voice_input_preview"),
             "🎤 Voice: hello from volcengine",
+        )
+
+    async def test_volcengine_delete_failure_does_not_break_successful_reply(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        old_provider = bot_module.config.transcription_provider
+        config_module.config.transcription_provider = "volcengine"
+        bot_module.config.transcription_provider = "volcengine"
+
+        async def run_now(user_id, run_task, on_overflow):
+            del user_id, on_overflow
+            await run_task()
+            return True
+
+        bot._enqueue_user_task = run_now
+        bot._download_voice_file = AsyncMock(return_value=None)
+        bot._prepare_audio_for_whisper = AsyncMock(
+            side_effect=lambda path, cleanup: path
+        )
+        bot._process_user_message_text = AsyncMock()
+        uploader = SimpleNamespace(
+            upload_file_with_object_key=MagicMock(
+                return_value=SimpleNamespace(
+                    signed_url="https://tos.example.com/stage/voice.ogg?X-Tos-Signature=abc",
+                    object_key="telegram-voice/11/object.ogg",
+                )
+            ),
+            delete_object=MagicMock(side_effect=TOSUploadError("delete failed")),
+            redact_signed_url=lambda url: (
+                "https://tos.example.com/stage/voice.ogg?***REDACTED***"
+            ),
+        )
+        bot._get_volcengine_tos_uploader = lambda: uploader
+        transcriber = SimpleNamespace(
+            transcribe_audio=AsyncMock(return_value="hello from volcengine")
+        )
+        bot._get_volcengine_transcriber = lambda: transcriber
+        voice = SimpleNamespace(file_id="v1", duration=30, mime_type="audio/ogg")
+        update = _build_update(11, voice)
+
+        try:
+            with TemporaryDirectory() as td:
+                bot._audio_dir = Path(td)
+                await bot._handle_voice_message(update, None)
+        finally:
+            config_module.config.transcription_provider = old_provider
+            bot_module.config.transcription_provider = old_provider
+
+        transcriber.transcribe_audio.assert_awaited_once()
+        uploader.delete_object.assert_called_once_with("telegram-voice/11/object.ogg")
+        bot._process_user_message_text.assert_awaited_once()
+
+    async def test_volcengine_transcription_failure_still_deletes_tos_object(self):
+        bot = TelegramBot()
+        bot._check_access = AsyncMock(return_value=True)
+
+        old_provider = bot_module.config.transcription_provider
+        config_module.config.transcription_provider = "volcengine"
+        bot_module.config.transcription_provider = "volcengine"
+
+        async def run_now(user_id, run_task, on_overflow):
+            del user_id, on_overflow
+            await run_task()
+            return True
+
+        bot._enqueue_user_task = run_now
+        bot._download_voice_file = AsyncMock(return_value=None)
+        uploader = SimpleNamespace(
+            upload_file_with_object_key=MagicMock(
+                return_value=SimpleNamespace(
+                    signed_url="https://tos.example.com/stage/voice.ogg?X-Tos-Signature=abc",
+                    object_key="telegram-voice/11/object.ogg",
+                )
+            ),
+            delete_object=MagicMock(return_value=None),
+            redact_signed_url=lambda url: (
+                "https://tos.example.com/stage/voice.ogg?***REDACTED***"
+            ),
+        )
+        bot._get_volcengine_tos_uploader = lambda: uploader
+        transcriber = SimpleNamespace(
+            transcribe_audio=AsyncMock(side_effect=TranscriptionError("asr failed"))
+        )
+        bot._get_volcengine_transcriber = lambda: transcriber
+        bot._process_user_message_text = AsyncMock()
+        voice = SimpleNamespace(file_id="v1", duration=30, mime_type="audio/ogg")
+        update = _build_update(11, voice)
+
+        try:
+            with TemporaryDirectory() as td:
+                bot._audio_dir = Path(td)
+                await bot._handle_voice_message(update, None)
+        finally:
+            config_module.config.transcription_provider = old_provider
+            bot_module.config.transcription_provider = old_provider
+
+        uploader.delete_object.assert_called_once_with("telegram-voice/11/object.ogg")
+        bot._process_user_message_text.assert_not_awaited()
+        self.assertTrue(
+            any(
+                "Failed to transcribe your voice message" in msg
+                for msg in update.message.replies
+            )
         )
 
     async def test_reports_missing_volcengine_configuration(self):

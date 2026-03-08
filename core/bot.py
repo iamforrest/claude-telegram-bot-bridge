@@ -1905,10 +1905,15 @@ class TelegramBot:
                         outcome = "download_failed"
                         return
 
+                    uploaded_object_key: Optional[str] = None
                     try:
-                        audio_url = await asyncio.to_thread(
-                            tos_uploader.upload_file, source_path, user_id
+                        uploaded = await asyncio.to_thread(
+                            tos_uploader.upload_file_with_object_key,
+                            source_path,
+                            user_id,
                         )
+                        audio_url = uploaded.signed_url
+                        uploaded_object_key = uploaded.object_key
                     except TOSUploadError as exc:
                         logger.error(
                             "Failed to upload voice file to TOS for user %s: %s",
@@ -1954,6 +1959,20 @@ class TelegramBot:
                         )
                         outcome = "transcription_failed"
                         return
+                    finally:
+                        if uploaded_object_key:
+                            try:
+                                await asyncio.to_thread(
+                                    tos_uploader.delete_object, uploaded_object_key
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to delete temporary TOS voice object for user %s key=%s: %s",
+                                    user_id,
+                                    uploaded_object_key,
+                                    exc,
+                                    exc_info=True,
+                                )
                 else:
                     logger.error(
                         "Unsupported transcription provider '%s' for user %s",

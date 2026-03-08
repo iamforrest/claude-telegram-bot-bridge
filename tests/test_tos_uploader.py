@@ -3,16 +3,29 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from telegram_bot.utils.tos_uploader import TOSUploadError, VolcengineTOSUploader
+from telegram_bot.utils.tos_uploader import (
+    TOSUploadError,
+    TOSUploadedObject,
+    VolcengineTOSUploader,
+)
 
 
 class _FakeTOSClient:
-    def __init__(self, *, put_error=None, sign_error=None, signed_url=""):
+    def __init__(
+        self,
+        *,
+        put_error=None,
+        sign_error=None,
+        delete_error=None,
+        signed_url="",
+    ):
         self.put_error = put_error
         self.sign_error = sign_error
+        self.delete_error = delete_error
         self.signed_url = signed_url
         self.put_calls = []
         self.sign_calls = []
+        self.delete_calls = []
 
     def put_object_from_file(self, **kwargs):
         self.put_calls.append(kwargs)
@@ -25,6 +38,12 @@ class _FakeTOSClient:
         if self.sign_error is not None:
             raise self.sign_error
         return SimpleNamespace(signed_url=self.signed_url)
+
+    def delete_object(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        if self.delete_error is not None:
+            raise self.delete_error
+        return SimpleNamespace()
 
 
 class TOSUploaderTests(unittest.TestCase):
@@ -66,6 +85,67 @@ class TOSUploaderTests(unittest.TestCase):
             self.assertEqual(kwargs["bucket"], "voice-stage")
             self.assertEqual(kwargs["key"], object_key)
             self.assertEqual(kwargs["expires"], 1200)
+
+    def test_upload_file_with_object_key_returns_metadata(self):
+        with TemporaryDirectory() as td:
+            path = Path(td) / "voice.ogg"
+            path.write_bytes(b"OggS")
+
+            client = _FakeTOSClient(
+                signed_url="https://tos.example.com/bucket/voice.ogg?X-Tos-Signature=abc"
+            )
+            uploader = VolcengineTOSUploader(
+                access_key="ak",
+                secret_access_key="sk",
+                endpoint="https://tos-cn-shanghai.volces.com",
+                region="cn-shanghai",
+                bucket_name="voice-stage",
+                signed_url_ttl_seconds=1200,
+                client=client,
+                http_method_get="GET",
+            )
+
+            uploaded = uploader.upload_file_with_object_key(path, user_id=42)
+
+            self.assertIsInstance(uploaded, TOSUploadedObject)
+            self.assertEqual(
+                uploaded.signed_url,
+                "https://tos.example.com/bucket/voice.ogg?X-Tos-Signature=abc",
+            )
+            self.assertTrue(uploaded.object_key.startswith("telegram-voice/42/"))
+            self.assertTrue(uploaded.object_key.endswith(".ogg"))
+
+    def test_delete_object_calls_tos_client(self):
+        client = _FakeTOSClient()
+        uploader = VolcengineTOSUploader(
+            access_key="ak",
+            secret_access_key="sk",
+            endpoint="https://tos-cn-shanghai.volces.com",
+            region="cn-shanghai",
+            bucket_name="voice-stage",
+            client=client,
+        )
+
+        uploader.delete_object("telegram-voice/42/object.ogg")
+
+        self.assertEqual(
+            client.delete_calls,
+            [{"bucket": "voice-stage", "key": "telegram-voice/42/object.ogg"}],
+        )
+
+    def test_delete_object_raises_when_client_delete_fails(self):
+        client = _FakeTOSClient(delete_error=RuntimeError("delete failed"))
+        uploader = VolcengineTOSUploader(
+            access_key="ak",
+            secret_access_key="sk",
+            endpoint="https://tos-cn-shanghai.volces.com",
+            region="cn-shanghai",
+            bucket_name="voice-stage",
+            client=client,
+        )
+
+        with self.assertRaises(TOSUploadError):
+            uploader.delete_object("telegram-voice/42/object.ogg")
 
     def test_upload_file_raises_when_upload_fails(self):
         with TemporaryDirectory() as td:

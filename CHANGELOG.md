@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-03-08
+
+### Fixed
+- Volcengine voice transcription now deletes the temporary TOS object after ASR completes, preventing staged voice files from accumulating over time
+- TOS cleanup failures are isolated to logs and no longer affect user-facing transcription replies
+
+### Changed
+- Extended TOS uploader API to return uploaded object metadata (`object_key` + signed URL) for explicit post-transcription cleanup
+- Added tests covering TOS object deletion on both success and failure paths
+
 ## [0.8.0] - 2026-03-08
 
 ### Added

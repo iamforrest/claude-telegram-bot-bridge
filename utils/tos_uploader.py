@@ -3,6 +3,7 @@ import logging
 import secrets
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse, urlunparse
@@ -12,6 +13,12 @@ logger = logging.getLogger(__name__)
 
 class TOSUploadError(RuntimeError):
     """Raised when uploading or signing a TOS object fails."""
+
+
+@dataclass(frozen=True)
+class TOSUploadedObject:
+    object_key: str
+    signed_url: str
 
 
 class VolcengineTOSUploader:
@@ -82,6 +89,12 @@ class VolcengineTOSUploader:
             self._http_method_get = self._http_method_get or "GET"
 
     def upload_file(self, local_path: Path, user_id: int) -> str:
+        uploaded = self.upload_file_with_object_key(local_path, user_id)
+        return uploaded.signed_url
+
+    def upload_file_with_object_key(
+        self, local_path: Path, user_id: int
+    ) -> TOSUploadedObject:
         source = Path(local_path)
         suffix = source.suffix or ".ogg"
         object_key = self._build_object_key(source, user_id, suffix)
@@ -116,7 +129,26 @@ class VolcengineTOSUploader:
             object_key,
             self.redact_signed_url(signed_url),
         )
-        return signed_url
+        return TOSUploadedObject(object_key=object_key, signed_url=signed_url)
+
+    def delete_object(self, object_key: str) -> None:
+        key = str(object_key or "").strip()
+        if not key:
+            raise ValueError("object_key is required for TOS delete.")
+
+        try:
+            self._client.delete_object(
+                bucket=self.bucket_name,
+                key=key,
+            )
+        except Exception as exc:
+            raise TOSUploadError("Failed to delete Volcengine TOS object.") from exc
+
+        logger.debug(
+            "Deleted temporary voice file from Volcengine TOS bucket=%s key=%s",
+            self.bucket_name,
+            key,
+        )
 
     @staticmethod
     def _build_object_key(source: Path, user_id: int, suffix: str) -> str:
