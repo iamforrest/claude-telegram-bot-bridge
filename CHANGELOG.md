@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-03-10
+
+### Fixed
+- Add event loop watchdog that detects zombie state (asyncio loop closed but process alive) and force-exits, allowing start.sh auto-restart to recover
+- Enable launchd `KeepAlive` so the service auto-restarts even if start.sh itself exits (e.g. rapid crash limit)
+
+### Changed
+- Enhanced `--status` command to detect inactive bots via log mtime checking, reporting detailed diagnostics instead of a misleading "running" status
+
+## [0.8.1] - 2026-03-08
+
+### Fixed
+- Volcengine voice transcription now deletes the temporary TOS object after ASR completes, preventing staged voice files from accumulating over time
+- TOS cleanup failures are isolated to logs and no longer affect user-facing transcription replies
+
+### Changed
+- Extended TOS uploader API to return uploaded object metadata (`object_key` + signed URL) for explicit post-transcription cleanup
+- Added tests covering TOS object deletion on both success and failure paths
+
+## [0.8.0] - 2026-03-08
+
+### Added
+- macOS voice reply mode with TTS support: bot automatically replies with voice when user sends voice messages, using macOS `say` command + ffmpeg conversion
+- Smart voice delivery strategy based on response length (voice-only, text+voice, or text-only fallback)
+- `VOICE_REPLY_PERSONA` config for selecting macOS TTS voice persona
+
+### Fixed
+- Voice reply mode gracefully falls back to text on non-macOS platforms
+
+### Changed
+- Updated README documentation (EN/ZH) with voice reply mode usage guide
+
+## [0.7.0] - 2026-03-08
+
+### Added
+- Volcengine ASR support for voice transcription as an alternative to OpenAI Whisper
+- TOS (Tencent Object Storage) upload flow for Volcengine ASR integration
+
+### Changed
+- Added Star History chart to README files
+
 ## [0.6.3] - 2026-03-06
 
 ### Changed

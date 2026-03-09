@@ -239,13 +239,54 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |
 | `DRAFT_UPDATE_INTERVAL` | No | `1.0` | Minimum seconds between streaming draft updates |
+| `TRANSCRIPTION_PROVIDER` | No | `whisper` | Voice transcription provider: `whisper` or `volcengine` |
 | `OPENAI_API_KEY` | Voice only | — | OpenAI API key for Whisper transcription |
 | `OPENAI_BASE_URL` | No | *(official OpenAI API)* | OpenAI-compatible Whisper endpoint base URL |
 | `WHISPER_MODEL` | No | `whisper-1` | Whisper model name |
-| `MAX_VOICE_DURATION` | No | `300` | Max accepted voice duration in seconds |
+| `VOLCENGINE_APP_ID` | Volcengine only | — | Volcengine ASR `X-Api-App-Key` |
+| `VOLCENGINE_TOKEN` | Volcengine only | — | Volcengine ASR `X-Api-Access-Key` |
+| `VOLCENGINE_ACCESS_KEY` | Volcengine only | — | Volcengine TOS Access Key |
+| `VOLCENGINE_SECRET_ACCESS_KEY` | Volcengine only | — | Volcengine TOS Secret Access Key (create at `https://console.volcengine.com/iam/keymanage`) |
+| `VOLCENGINE_TOS_BUCKET_NAME` | Volcengine only | — | TOS bucket used for staging Telegram voice files |
+| `VOLCENGINE_TOS_ENDPOINT` | Volcengine only | — | TOS endpoint (must match your bucket region, e.g. `https://tos-cn-shanghai.volces.com`) |
+| `VOLCENGINE_TOS_REGION` | No | `cn-beijing` | TOS region used by SDK signing |
 | `FFMPEG_PATH` | No | *(auto-detect)* | Absolute path to ffmpeg binary |
+| `VOICE_REPLY_PERSONA` | No | `Tingting` | Persona name used by voice reply mode |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `PROXY_URL` | No | — | HTTP proxy; auto-configures `http_proxy`/`https_proxy`/`all_proxy` |
+
+## Voice Transcription Channels
+
+- Default channel is `whisper`.
+- To use Volcengine file-fast ASR, set:
+  - `TRANSCRIPTION_PROVIDER=volcengine`
+  - `VOLCENGINE_APP_ID`
+  - `VOLCENGINE_TOKEN`
+  - `VOLCENGINE_ACCESS_KEY`
+  - `VOLCENGINE_SECRET_ACCESS_KEY`
+  - `VOLCENGINE_TOS_BUCKET_NAME`
+  - `VOLCENGINE_TOS_ENDPOINT`
+- Secret Access Key must be created in Volcengine IAM key management:
+  - `https://console.volcengine.com/iam/keymanage`
+- In Volcengine mode, the bot now uses `download -> TOS upload -> signed TOS URL -> ASR`.
+
+## Voice Reply Mode (macOS)
+
+- User voice messages switch reply mode to voice automatically.
+- User text messages switch reply mode back to text.
+- In voice mode:
+  - `>1000` Chinese characters or `>1000` English words: text only (voice mode is kept)
+  - `>300` characters (and not over 1000 threshold): send voice + text
+  - Otherwise: send voice only
+- Voice transcription preview (`🎤 Voice: ...`) is bundled with the final reply:
+  - if text is sent, preview is merged at the top of that same text message
+  - if voice-only reply is sent, the bot sends preview text first, then voice
+- The bot uses macOS `say` for synthesis, then converts output to Telegram-compatible `ogg/opus` via `ffmpeg`.
+- `VOICE_REPLY_PERSONA` should be a real macOS voice name from `say -v ?`.
+- If `VOICE_REPLY_PERSONA` is unavailable on current system, the bot sends a friendly error and falls back to text for that reply.
+- Set `VOICE_REPLY_PERSONA` to the first-column name shown by `say -v ?`.
+- Example:
+  - `VOICE_REPLY_PERSONA=Tingting`
 
 ## ffmpeg Installation
 

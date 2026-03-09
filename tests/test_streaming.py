@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+# mypy: disable-error-code=attr-defined
 
 import unittest
 from types import SimpleNamespace

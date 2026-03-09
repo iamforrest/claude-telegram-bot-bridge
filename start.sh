@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$SCRIPT_DIR/venv"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
 ENV_FILE="$SCRIPT_DIR/.env"
+REQ_HASH_FILE="$VENV_DIR/.req_hash"
 
 # Colors for output
 RED='\033[0;31m'
@@ -18,6 +19,46 @@ NC='\033[0m'
 # Version check cache
 CACHE_DIR="$HOME/.telegram-bot-cache"
 CACHE_FILE="$CACHE_DIR/update_check"
+
+get_requirements_hash() {
+    md5 -q "$REQ_FILE" 2>/dev/null || md5sum "$REQ_FILE" | cut -d' ' -f1
+}
+
+ensure_venv() {
+    if [ -d "$VENV_DIR" ]; then
+        return 0
+    fi
+
+    echo "📦 Virtual environment not found, creating..."
+    if ! python3 -m venv "$VENV_DIR"; then
+        echo "❌ Failed to create virtual environment: $VENV_DIR"
+        exit 1
+    fi
+}
+
+sync_dependencies() {
+    local force_install="$1"
+    local current_hash saved_hash
+
+    current_hash="$(get_requirements_hash)"
+    [ -f "$REQ_HASH_FILE" ] && saved_hash="$(cat "$REQ_HASH_FILE")"
+
+    if [ "$force_install" = "1" ] || [ -z "$saved_hash" ] || [ "$saved_hash" != "$current_hash" ]; then
+        echo "📦 Installing Python dependencies..."
+        if ! "$VENV_DIR/bin/pip" install -q --upgrade pip; then
+            echo "❌ Failed to upgrade pip"
+            exit 1
+        fi
+        if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
+            echo "❌ Dependency installation failed"
+            exit 1
+        fi
+        echo "$current_hash" > "$REQ_HASH_FILE"
+        echo "✅ Dependencies are up to date"
+    else
+        echo -e "\033[90m✓ Dependencies unchanged (requirements hash match)\033[0m"
+    fi
+}
 
 get_current_version() {
     grep -E "^## \[[0-9]" "$SCRIPT_DIR/CHANGELOG.md" | head -1 | sed -E 's/^## \[([0-9.]+)\].*/\1/'
@@ -56,18 +97,11 @@ check_update() {
     fi
 }
 
-# Check if installation is complete
-if [ ! -d "$VENV_DIR" ] || [ ! -f "$ENV_FILE" ]; then
+# Basic repository sanity check
+if [ ! -f "$REQ_FILE" ]; then
     echo ""
-    echo -e "${RED}❌ Installation not found${NC}"
-    echo ""
-    echo "Please run the installation script first:"
-    echo -e "  ${BLUE}./setup.sh${NC}"
-    echo ""
-    echo "The installation wizard will guide you through:"
-    echo "  • System requirements check"
-    echo "  • Bot configuration (Token, whitelist, proxy)"
-    echo "  • Python environment setup"
+    echo -e "${RED}❌ requirements.txt not found: $REQ_FILE${NC}"
+    echo "Please run this script from the project repository."
     echo ""
     exit 1
 fi
@@ -133,7 +167,7 @@ Options:
   --debug             Enable debug/verbose logging
   --status            Show whether the bot is running
   --stop              Stop the running bot
-  --upgrade           Update bot to latest version
+  --upgrade           Update bot to latest version and reinstall dependencies
   --install           Install as macOS launchd startup service
   --uninstall         Remove macOS launchd startup service
 EOF
@@ -192,7 +226,15 @@ is_running() {
 }
 
 cleanup_pid() {
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" 2>/dev/null || true
+}
+
+get_mtime_epoch() {
+    local file="$1"
+    if [ ! -e "$file" ]; then
+        return 1
+    fi
+    stat -f "%m" "$file" 2>/dev/null || stat -c "%Y" "$file" 2>/dev/null
 }
 
 # ── Action handlers ──
@@ -201,13 +243,36 @@ do_status() {
     local pid
     pid="$(read_pid)"
     if [ -z "$pid" ]; then
-        echo "⚪ Bot is not running (no PID file)"
+        echo "🔴 Bot status: unavailable (no PID file; common causes: process exited/crashed, service not started)"
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
-        echo "🟢 Bot is running (PID: $pid)"
+        local bot_log="$LOGS_DIR/bot.log"
+        local now mtime age_seconds age_minutes
+        local inactive_after_seconds="${STATUS_INACTIVE_SECONDS:-900}"
+
+        if [ ! -f "$bot_log" ]; then
+            echo "🔴 Bot status: unavailable (PID: $pid, bot.log missing; common causes: startup did not complete, log path/permission issue)"
+            exit 2
+        fi
+
+        now="$(date +%s)"
+        mtime="$(get_mtime_epoch "$bot_log")"
+        if [ -z "$mtime" ] || [ "$mtime" -gt "$now" ]; then
+            echo "🔴 Bot status: unavailable (PID: $pid, invalid log timestamp; common causes: filesystem clock/mtime anomaly)"
+            exit 2
+        fi
+
+        age_seconds=$((now - mtime))
+        if [ "$age_seconds" -ge "$inactive_after_seconds" ]; then
+            age_minutes=$((age_seconds / 60))
+            echo "🔴 Bot status: unavailable (PID: $pid, inactive for ${age_minutes}m; common causes: proxy/network down, getUpdates conflict from another instance, worker hung)"
+            exit 2
+        fi
+
+        echo "🟢 Bot status: running (PID: $pid, last log update ${age_seconds}s ago)"
     else
-        echo "🔴 Bot is not running (PID $pid is stale)"
+        echo "🔴 Bot status: unavailable (stale PID: $pid; common causes: process crashed/exited, stale pid file cleanup failed)"
         cleanup_pid
     fi
     exit 0
@@ -362,7 +427,7 @@ do_install() {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
     <key>StandardOutPath</key>
     <string>${LOGS_DIR}/launchd_stdout.log</string>
     <key>StandardErrorPath</key>
@@ -412,7 +477,10 @@ do_upgrade() {
     fi
 
     if ! compare_versions "$current" "$latest"; then
-        echo "✅ Already up to date (v${current})"
+        echo "✅ Already up to date (v${current}), syncing dependencies..."
+        ensure_venv
+        sync_dependencies 1
+        echo "✅ Dependency sync complete"
         exit 0
     fi
 
@@ -429,11 +497,8 @@ do_upgrade() {
         exit 1
     fi
 
-    echo "📦 Reinstalling dependencies..."
-    if ! "$VENV_DIR/bin/pip" install -q -r "$REQ_FILE"; then
-        echo "❌ Dependency installation failed"
-        exit 1
-    fi
+    ensure_venv
+    sync_dependencies 1
 
     current="$(get_current_version)"
     echo "✅ Upgrade complete! Now running v${current}"
@@ -571,6 +636,9 @@ if ! command -v python3 &> /dev/null; then
     echo "❌ Error: Python 3.11+ is required"
     exit 1
 fi
+
+ensure_venv
+sync_dependencies 0
 
 # Activate virtual environment
 echo "✅ Activating virtual environment"

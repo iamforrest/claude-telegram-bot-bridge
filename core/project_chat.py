@@ -65,7 +65,7 @@ def _patch_sdk_cli_resolution() -> None:
     def patched_find_cli(self):
         return cli_path
 
-    SubprocessCLITransport._find_cli = patched_find_cli
+    setattr(SubprocessCLITransport, "_find_cli", patched_find_cli)
     setattr(SubprocessCLITransport, marker, True)
     logger.info(f"Patched SDK CLI resolution to use configured path: {cli_path}")
 
@@ -77,8 +77,18 @@ PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
 CONVERSATIONS_DIR = Path.home() / ".claude" / "projects" / PROJECT_DIR_NAME
 
 ALLOWED_TOOLS = [
-    "Read", "Edit", "Write", "MultiEdit", "Glob", "Grep",
-    "WebFetch", "WebSearch", "Task", "NotebookEdit", "TodoWrite", "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "NotebookEdit",
+    "TodoWrite",
+    "Bash",
     # AskUserQuestion is handled via disallowed_tools + can_use_tool callback
 ]
 
@@ -119,17 +129,18 @@ def _detect_numbered_options(text: str) -> bool:
     Returns True if the text appears to contain a question with numbered choices.
     """
     import re
+
     # Look for pattern: number followed by period and text, appearing multiple times
     # Must have at least 2 numbered items to be considered options
-    pattern = r'^\s*\d+\.\s+.+$'
+    pattern = r"^\s*\d+\.\s+.+$"
     matches = re.findall(pattern, text, re.MULTILINE)
     return len(matches) >= 2
 
 
 # Callback type: async (chat_id, user_id, tool_name, tool_input) -> bool | PermissionResult
 PermissionCallback = Callable[[int, int, str, Dict[str, Any]], Awaitable]
-# Callback type: async () -> None, sends typing action
-TypingCallback = Callable[[], Awaitable[None]]
+# Callback type: async () -> Any, sends typing action
+TypingCallback = Callable[[], Awaitable[Any]]
 
 TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 
@@ -137,6 +148,7 @@ TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 @dataclass
 class ChatResponse:
     """Response from processing a message"""
+
     content: str
     success: bool = True
     error: Optional[str] = None
@@ -205,16 +217,22 @@ class ProjectChatHandler:
             self._stream_init_locks[user_id] = lock
         return lock
 
-    async def _create_user_stream(self, user_id: int, model: Optional[str]) -> _UserStreamState:
+    async def _create_user_stream(
+        self, user_id: int, model: Optional[str]
+    ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
 
         async def can_use_tool(tool_name, tool_input, _context=None):
             print(f"[DEBUG] can_use_tool called: {tool_name}")
-            logger.debug(f"can_use_tool called: tool_name={tool_name}, tool_input type={type(tool_input)}")
+            logger.debug(
+                f"can_use_tool called: tool_name={tool_name}, tool_input type={type(tool_input)}"
+            )
             # AskUserQuestion: degrade to plain text instead of interactive dialog
             if tool_name == "AskUserQuestion" and isinstance(tool_input, dict):
                 formatted, _ = _format_ask_user_question(tool_input)
-                logger.debug(f"AskUserQuestion intercepted, formatted: {formatted[:200]}...")
+                logger.debug(
+                    f"AskUserQuestion intercepted, formatted: {formatted[:200]}..."
+                )
                 s = state_holder.get("state")
                 if s and s.pending:
                     s.pending[0].synthetic_response = formatted
@@ -276,10 +294,14 @@ class ProjectChatHandler:
         state = _UserStreamState(client=client, model=model)
         state_holder["state"] = state
         state.reader_task = asyncio.create_task(self._reader_loop(user_id, state))
-        state.typing_task = asyncio.create_task(self._typing_keepalive_loop(user_id, state))
+        state.typing_task = asyncio.create_task(
+            self._typing_keepalive_loop(user_id, state)
+        )
         return state
 
-    async def _disconnect_user_stream(self, user_id: int, cancel_message: Optional[str] = None) -> bool:
+    async def _disconnect_user_stream(
+        self, user_id: int, cancel_message: Optional[str] = None
+    ) -> bool:
         state = self._streams.pop(user_id, None)
         if not state:
             return False
@@ -300,7 +322,9 @@ class ProjectChatHandler:
             try:
                 await asyncio.wait_for(state.reader_task, timeout=2.0)
             except asyncio.TimeoutError:
-                logger.warning(f"Reader task for user {user_id} did not complete within timeout")
+                logger.warning(
+                    f"Reader task for user {user_id} did not complete within timeout"
+                )
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -312,7 +336,14 @@ class ProjectChatHandler:
             req = state.pending.popleft()
             if not req.future.done():
                 try:
-                    req.future.set_result(ChatResponse(content=msg, success=False, error=msg, session_id=state.last_session_id))
+                    req.future.set_result(
+                        ChatResponse(
+                            content=msg,
+                            success=False,
+                            error=msg,
+                            session_id=state.last_session_id,
+                        )
+                    )
                 except Exception as e:
                     logger.error(f"Error setting future result: {e}")
 
@@ -365,7 +396,9 @@ class ProjectChatHandler:
                 self._streams[user_id] = state
             return state
 
-    async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
+    async def _typing_keepalive_loop(
+        self, user_id: int, state: _UserStreamState
+    ) -> None:
         """Background task that sends typing actions at regular intervals.
 
         Keeps Telegram typing indicator alive during long tool calls when
@@ -390,7 +423,9 @@ class ProjectChatHandler:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True)
+            logger.error(
+                f"Typing keepalive loop crashed for user {user_id}: {e}", exc_info=True
+            )
 
     async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:
         try:
@@ -408,7 +443,9 @@ class ProjectChatHandler:
                         pass
 
                 if isinstance(msg, AssistantMessage):
-                    logger.debug(f"Received AssistantMessage with {len(msg.content)} blocks")
+                    logger.debug(
+                        f"Received AssistantMessage with {len(msg.content)} blocks"
+                    )
                     req.last_assistant_texts = []
                     for block in msg.content:
                         if isinstance(block, TextBlock):
@@ -417,14 +454,18 @@ class ProjectChatHandler:
                             # Update streaming draft if handler is available
                             if req.streaming_handler:
                                 try:
-                                    await req.streaming_handler.update_if_needed(block.text)
+                                    await req.streaming_handler.update_if_needed(
+                                        block.text
+                                    )
                                 except Exception as e:
                                     logger.error(f"Streaming update failed: {e}")
                             if os.environ.get("BOT_DEBUG"):
                                 print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
                         elif isinstance(block, ToolUseBlock):
                             if os.environ.get("BOT_DEBUG"):
-                                print(f"\033[33m[Tool: {block.name}]\033[0m {str(block.input)[:150]}")
+                                print(
+                                    f"\033[33m[Tool: {block.name}]\033[0m {str(block.input)[:150]}"
+                                )
                     continue
 
                 if isinstance(msg, ResultMessage):
@@ -439,7 +480,10 @@ class ProjectChatHandler:
                             logger.error(f"Streaming finalization failed: {e}")
 
                     if req.synthetic_response:
-                        content = self._clean_response(req.synthetic_response) or "(No response)"
+                        content = (
+                            self._clean_response(req.synthetic_response)
+                            or "(No response)"
+                        )
                     else:
                         content = self._clean_response(result_text) or "(No response)"
 
@@ -449,24 +493,48 @@ class ProjectChatHandler:
 
                     if msg.is_error:
                         logger.error(f"SDK returned error: {content[:500]}")
-                        log_chat(req.user_id, msg.session_id or req.requested_session_id, "assistant", content, model=req.model, success=False)
+                        log_chat(
+                            req.user_id,
+                            msg.session_id or req.requested_session_id,
+                            "assistant",
+                            content,
+                            model=req.model,
+                            success=False,
+                        )
                         response = ChatResponse(
                             content=f"❌ Processing failed: {content}",
                             success=False,
                             error=content,
                             session_id=msg.session_id,
-                            streamed=bool(req.streaming_handler and req.streaming_handler.drafts),
+                            streamed=bool(
+                                req.streaming_handler and req.streaming_handler.drafts
+                            ),
                         )
                     else:
-                        log_chat(req.user_id, msg.session_id or req.requested_session_id, "assistant", content, model=req.model)
+                        log_chat(
+                            req.user_id,
+                            msg.session_id or req.requested_session_id,
+                            "assistant",
+                            content,
+                            model=req.model,
+                        )
                         # Check if response contains numbered options (even without synthetic_response)
-                        has_options = req.synthetic_response is not None or _detect_numbered_options(content)
+                        has_options = (
+                            req.synthetic_response is not None
+                            or _detect_numbered_options(content)
+                        )
                         # Message is considered streamed if drafts were created, regardless of options
                         # Options will be sent separately by _reply_smart()/_send_smart()
-                        is_streamed = bool(req.streaming_handler and req.streaming_handler.drafts)
-                        logger.debug(f"Response ready: has_synthetic={bool(req.synthetic_response)}, has_numbered_options={_detect_numbered_options(content)}, has_options={has_options}, is_streamed={is_streamed}, content_len={len(content)}")
+                        is_streamed = bool(
+                            req.streaming_handler and req.streaming_handler.drafts
+                        )
+                        logger.debug(
+                            f"Response ready: has_synthetic={bool(req.synthetic_response)}, has_numbered_options={_detect_numbered_options(content)}, has_options={has_options}, is_streamed={is_streamed}, content_len={len(content)}"
+                        )
                         response = ChatResponse(
-                            content=content, success=True, session_id=msg.session_id,
+                            content=content,
+                            success=True,
+                            session_id=msg.session_id,
                             has_options=has_options,
                             streamed=is_streamed,
                         )
@@ -499,12 +567,23 @@ class ProjectChatHandler:
                     try:
                         await req.streaming_handler.finalize_all()
                     except Exception as finalize_err:
-                        logger.error(f"Streaming finalization on error failed: {finalize_err}")
+                        logger.error(
+                            f"Streaming finalization on error failed: {finalize_err}"
+                        )
                 err = str(e)
-                log_chat(req.user_id, req.requested_session_id, "error", err, success=False)
+                log_chat(
+                    req.user_id, req.requested_session_id, "error", err, success=False
+                )
                 if not req.future.done():
                     try:
-                        req.future.set_result(ChatResponse(content=f"❌ Error: {err}", success=False, error=err, session_id=state.last_session_id))
+                        req.future.set_result(
+                            ChatResponse(
+                                content=f"❌ Error: {err}",
+                                success=False,
+                                error=err,
+                                session_id=state.last_session_id,
+                            )
+                        )
                     except Exception as set_err:
                         logger.error(f"Error setting error result: {set_err}")
 
@@ -548,6 +627,7 @@ class ProjectChatHandler:
         streaming_handler = None
         if bot:
             from telegram_bot.core.streaming import StreamingMessageHandler
+
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
 
         request = _PendingRequest(
@@ -565,15 +645,21 @@ class ProjectChatHandler:
         try:
             state = await self._get_or_create_stream(user_id, model, new_session)
             async with state.send_lock:
-                request.sent_session_id = session_id or state.last_session_id or "default"
+                request.sent_session_id = (
+                    session_id or state.last_session_id or "default"
+                )
                 state.pending.append(request)
-                await state.client.query(user_message, session_id=request.sent_session_id)
+                await state.client.query(
+                    user_message, session_id=request.sent_session_id
+                )
                 logger.info(
                     f"Submitted message to live stream: user={user_id}, pending={len(state.pending)}, "
                     f"session_key={request.sent_session_id}"
                 )
                 if config.claude_cli_path:
-                    logger.info(f"Using configured Claude CLI path: {config.claude_cli_path}")
+                    logger.info(
+                        f"Using configured Claude CLI path: {config.claude_cli_path}"
+                    )
 
             return await asyncio.wait_for(future, timeout=PROCESS_TIMEOUT)
 
@@ -613,7 +699,9 @@ class ProjectChatHandler:
 
     async def stop(self, user_id: int) -> bool:
         """Stop active stream for a user and fail all pending requests."""
-        return await self._disconnect_user_stream(user_id, cancel_message="🛑 Task has been terminated.")
+        return await self._disconnect_user_stream(
+            user_id, cancel_message="🛑 Task has been terminated."
+        )
 
     async def cancel_user_streaming(self, user_id: int) -> bool:
         """Cancel streaming for a user by calling cancel() on all pending streaming handlers."""
@@ -653,7 +741,9 @@ class ProjectChatHandler:
             # Close SDK client
             try:
                 if state.client:
-                    asyncio.create_task(state.client.close())
+                    close_fn = getattr(state.client, "close", None)
+                    if callable(close_fn):
+                        asyncio.create_task(close_fn())
             except Exception as e:
                 logger.error(f"Error closing SDK client for user {user_id}: {e}")
             # Remove from streams dict
@@ -666,8 +756,8 @@ class ProjectChatHandler:
         if state:
             # Clear any pending permission requests
             for req in list(state.pending):
-                if req.permission_future and not req.permission_future.done():
-                    req.permission_future.cancel()
+                if req.future and not req.future.done():
+                    req.future.cancel()
             logger.info(f"Cleared pending permissions for user {user_id}")
 
     def list_sessions(self, limit: int = 10) -> List[Tuple[str, str, float]]:
@@ -675,9 +765,11 @@ class ProjectChatHandler:
         conv_dir = CONVERSATIONS_DIR
         if not conv_dir.exists():
             return []
-        files = sorted(conv_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        files = sorted(
+            conv_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True
+        )
         results = []
-        for f in files[:limit * 2]:
+        for f in files[: limit * 2]:
             session_id = f.stem
             mtime = f.stat().st_mtime
             first_msg = self._extract_first_user_message(f)
@@ -687,7 +779,9 @@ class ProjectChatHandler:
                 break
         return results
 
-    def get_session_last_assistant_message(self, session_id: str, max_chars: int = 300) -> Optional[str]:
+    def get_session_last_assistant_message(
+        self, session_id: str, max_chars: int = 300
+    ) -> Optional[str]:
         """Extract the last assistant text message from a session JSONL file."""
         filepath = CONVERSATIONS_DIR / f"{session_id}.jsonl"
         if not filepath.exists():
@@ -721,7 +815,9 @@ class ProjectChatHandler:
         except Exception:
             return None
 
-    def get_recent_messages(self, session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def get_recent_messages(
+        self, session_id: str, limit: int = 5
+    ) -> List[Dict[str, Any]]:
         """Get the last N messages from a session in chronological order."""
         filepath = CONVERSATIONS_DIR / f"{session_id}.jsonl"
         if not filepath.exists():
@@ -760,18 +856,18 @@ class ProjectChatHandler:
                         continue
 
                     timestamp = d.get("timestamp", "")
-                    all_messages.append({
-                        "role": role,
-                        "content": text,
-                        "timestamp": timestamp
-                    })
+                    all_messages.append(
+                        {"role": role, "content": text, "timestamp": timestamp}
+                    )
 
             return all_messages[-limit:] if all_messages else []
         except Exception as e:
             logger.error(f"Error reading session messages: {e}")
             return []
 
-    def get_conversation_history(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_conversation_history(
+        self, session_id: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
         """Get conversation history with message index for revert operations.
 
         Returns list of USER messages only with index, timestamp, role, and content preview.
@@ -814,12 +910,14 @@ class ProjectChatHandler:
                         continue
 
                     timestamp = d.get("timestamp", "")
-                    all_messages.append({
-                        "index": idx,
-                        "role": role,
-                        "content": text,
-                        "timestamp": timestamp
-                    })
+                    all_messages.append(
+                        {
+                            "index": idx,
+                            "role": role,
+                            "content": text,
+                            "timestamp": timestamp,
+                        }
+                    )
 
             # Return newest first (reverse order)
             recent_messages = all_messages[-limit:] if all_messages else []
@@ -858,7 +956,9 @@ class ProjectChatHandler:
     def _clean_response(self, response: str) -> str:
         ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
         cleaned = ansi_escape.sub("", response)
-        cleaned = "".join(char for char in cleaned if ord(char) >= 32 or char in "\n\r\t")
+        cleaned = "".join(
+            char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
+        )
         return cleaned.strip()
 
 
