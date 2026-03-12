@@ -43,16 +43,28 @@ class TestConnectionResilience(unittest.TestCase):
         """Set up test fixtures."""
         self.bot = TelegramBot()
 
-    def test_builder_configures_timeouts(self):
+    @patch('telegram_bot.core.bot.Application')
+    def test_builder_configures_timeouts(self, mock_app_class):
         """Test that Application.builder() configures proper timeout values."""
+        # Setup mock builder chain
+        mock_builder = Mock()
+        mock_app_class.builder.return_value = mock_builder
+
+        # Make builder methods return self for chaining
+        mock_builder.token.return_value = mock_builder
+        mock_builder.concurrent_updates.return_value = mock_builder
+        mock_builder.get_updates_read_timeout.return_value = mock_builder
+        mock_builder.get_updates_connect_timeout.return_value = mock_builder
+        mock_builder.get_updates_pool_timeout.return_value = mock_builder
+        mock_builder.post_init.return_value = mock_builder
+        mock_builder.build.return_value = Mock()
+
         self.bot.build()
 
-        # Verify application was built
-        self.assertIsNotNone(self.bot.application)
-
-        # Verify timeout configuration exists
-        request = self.bot.application.bot.request
-        self.assertIsNotNone(request)
+        # Verify timeout methods were called with proper values
+        mock_builder.get_updates_read_timeout.assert_called_once_with(30)
+        mock_builder.get_updates_connect_timeout.assert_called_once_with(10)
+        mock_builder.get_updates_pool_timeout.assert_called_once_with(5)
 
     @patch('time.sleep')
     def test_network_error_retries_then_succeeds(self, mock_sleep):

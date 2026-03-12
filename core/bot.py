@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import shlex
+import socket
 import time
 from pathlib import Path as FilePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -127,6 +128,9 @@ class TelegramBot:
             Application.builder()
             .token(config.telegram_bot_token)
             .concurrent_updates(True)
+            .get_updates_read_timeout(30)
+            .get_updates_connect_timeout(10)
+            .get_updates_pool_timeout(5)
             .post_init(self._post_init)
             .build()
         )
