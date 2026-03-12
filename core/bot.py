@@ -139,29 +139,39 @@ class TelegramBot:
             self.build()
 
         logger.info("⏳ Starting...")
-        try:
-            self.application.run_polling()
-        except telegram.error.InvalidToken:
-            raise SystemExit(
-                "❌ Invalid Telegram Bot Token. "
-                "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
-                "   Get a valid token from @BotFather on Telegram."
-            )
-        except telegram.error.Conflict:
-            raise SystemExit(
-                "❌ Another bot instance is already running with the same token.\n"
-                "   Use --stop to stop it first, or check for duplicate processes."
-            )
-        except telegram.error.NetworkError as e:
-            raise SystemExit(
-                f"❌ Network error: {e}\n"
-                "   Check your internet connection and PROXY_URL settings."
-            )
-        except telegram.error.Forbidden as e:
-            raise SystemExit(
-                f"❌ Bot token was revoked or bot is blocked: {e}\n"
-                "   Create a new token via @BotFather on Telegram."
-            )
+        retry_count = 0
+        while retry_count < config.network_retry_attempts:
+            try:
+                self.application.run_polling()
+                break
+            except telegram.error.InvalidToken:
+                raise SystemExit(
+                    "❌ Invalid Telegram Bot Token. "
+                    "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
+                    "   Get a valid token from @BotFather on Telegram."
+                )
+            except telegram.error.Conflict:
+                raise SystemExit(
+                    "❌ Another bot instance is already running with the same token.\n"
+                    "   Use --stop to stop it first, or check for duplicate processes."
+                )
+            except telegram.error.NetworkError as e:
+                retry_count += 1
+                if retry_count >= config.network_retry_attempts:
+                    raise SystemExit(
+                        f"❌ Network error after {config.network_retry_attempts} attempts: {e}\n"
+                        "   Check your internet connection and PROXY_URL settings."
+                    )
+                logger.warning(
+                    f"Network error (attempt {retry_count}/{config.network_retry_attempts}): {e}. "
+                    f"Retrying in {config.network_retry_delay}s..."
+                )
+                time.sleep(config.network_retry_delay)
+            except telegram.error.Forbidden as e:
+                raise SystemExit(
+                    f"❌ Bot token was revoked or bot is blocked: {e}\n"
+                    "   Create a new token via @BotFather on Telegram."
+                )
 
         logger.info("Bot stopped")
 
