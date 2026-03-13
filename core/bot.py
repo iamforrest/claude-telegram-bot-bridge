@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import shlex
+import signal
 import socket
 import time
 from pathlib import Path as FilePath
@@ -56,6 +57,10 @@ logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
 
 
+class _PollingRestart(Exception):
+    """Signal to restart polling loop."""
+
+
 def _esc_md2(text: str) -> str:
     """Escape MarkdownV2 special characters."""
     return re.sub(r"([_*\[\]()~`>#+=|{}.!\\-])", r"\\\1", text)
@@ -96,22 +101,10 @@ class TelegramBot:
     _MAX_INFLIGHT_MESSAGES = 3
     _STALE_AUDIO_SECONDS = 24 * 60 * 60
     _WATCHDOG_INTERVAL = 60
+    _NETWORK_FAILURE_THRESHOLD = 300  # 5 min of consecutive failures → force exit
 
-    async def _event_loop_watchdog(self):
-        """Periodically verify the event loop is alive; force-exit if it dies."""
-        while True:
-            await asyncio.sleep(self._WATCHDOG_INTERVAL)
-            loop = asyncio.get_event_loop()
-            if loop.is_closed() or not loop.is_running():
-                logger.critical(
-                    "Event loop is dead (closed=%s, running=%s), forcing exit",
-                    loop.is_closed(),
-                    loop.is_running(),
-                )
-                os._exit(1)
-
-    async def _post_init(self, application: Application):
-        """Called after application.initialize() by run_polling()"""
+    async def _on_ready(self, application: Application):
+        """Called after application.initialize() — sets up commands and cleanup."""
         self._audio_dir.mkdir(parents=True, exist_ok=True)
         removed = await self._cleanup_stale_audio_files(
             self._audio_dir, max_age_seconds=self._STALE_AUDIO_SECONDS
@@ -119,11 +112,10 @@ class TelegramBot:
         if removed:
             logger.info("Startup audio cleanup removed %s stale file(s)", removed)
         await self._set_bot_commands()
-        asyncio.create_task(self._event_loop_watchdog())
-        logger.info("✅ Bot initialization complete")
+        logger.info("Bot initialization complete")
 
     def build(self):
-        """Build the application"""
+        """Build the application (no post_init — lifecycle managed manually)."""
         self.application = (
             Application.builder()
             .token(config.telegram_bot_token)
@@ -131,7 +123,6 @@ class TelegramBot:
             .get_updates_read_timeout(30)
             .get_updates_connect_timeout(10)
             .get_updates_pool_timeout(5)
-            .post_init(self._post_init)
             .build()
         )
         self._setup_handlers()
@@ -141,70 +132,173 @@ class TelegramBot:
     _MAX_RAPID_CRASHES = 5
 
     def run(self):
-        """Run the bot with auto-restart on unexpected polling exits.
+        """Run the bot with in-process polling restart capability."""
+        try:
+            asyncio.run(self._run_async())
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception("Unexpected error in bot run loop")
+            raise
 
-        When run_polling() returns normally (e.g. SDK crash triggers graceful
-        shutdown), the application is rebuilt and polling restarts automatically.
-        Only gives up after _MAX_RAPID_CRASHES consecutive short-lived sessions.
-        """
+    async def _run_async(self):
+        """Async entry: manage Application lifecycle and polling restart loop."""
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+
         rapid_crash_count = 0
 
-        while True:
+        while not stop_event.is_set():
             if not self.application:
                 self.build()
 
-            logger.info("⏳ Starting...")
+            logger.info("Starting...")
             start_time = time.time()
+
             try:
-                self.application.run_polling()
+                await self.application.initialize()
             except telegram.error.InvalidToken:
                 raise SystemExit(
-                    "❌ Invalid Telegram Bot Token. "
+                    "Invalid Telegram Bot Token. "
                     "Please check TELEGRAM_BOT_TOKEN in your .env file.\n"
                     "   Get a valid token from @BotFather on Telegram."
                 )
             except telegram.error.Conflict:
                 raise SystemExit(
-                    "❌ Another bot instance is already running with the same token.\n"
+                    "Another bot instance is already running with the same token.\n"
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
-            except telegram.error.NetworkError as e:
-                logger.warning(
-                    "Network error: %s. Retrying in %ss...",
-                    e,
-                    config.network_retry_delay,
+
+            await self._on_ready(self.application)
+
+            watchdog_task = None
+            try:
+                await self.application.start()
+                await self.application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
                 )
-                time.sleep(config.network_retry_delay)
-                self.application = None
+
+                logger.info("Bot is running")
+
+                watchdog_task = asyncio.create_task(
+                    self._polling_watchdog(stop_event)
+                )
+
+                await self._wait_for_polling_exit(stop_event)
+
+            except _PollingRestart:
+                uptime = time.time() - start_time
+                if uptime < self._MIN_UPTIME:
+                    rapid_crash_count += 1
+                    if rapid_crash_count >= self._MAX_RAPID_CRASHES:
+                        raise SystemExit(
+                            f"Polling restarted {self._MAX_RAPID_CRASHES} times within "
+                            f"{self._MIN_UPTIME}s each. Giving up."
+                        )
+                    logger.warning(
+                        "Polling restart after only %.1fs (crash %d/%d)",
+                        uptime,
+                        rapid_crash_count,
+                        self._MAX_RAPID_CRASHES,
+                    )
+                else:
+                    rapid_crash_count = 0
+
+                logger.warning("Polling restart triggered, restarting...")
+                continue
+            except telegram.error.NetworkError as e:
+                logger.warning("Network error during startup: %s", e)
                 continue
             except telegram.error.Forbidden as e:
                 raise SystemExit(
-                    f"❌ Bot token was revoked or bot is blocked: {e}\n"
+                    f"Bot token was revoked or bot is blocked: {e}\n"
                     "   Create a new token via @BotFather on Telegram."
                 )
+            finally:
+                if watchdog_task and not watchdog_task.done():
+                    watchdog_task.cancel()
+                    try:
+                        await watchdog_task
+                    except (asyncio.CancelledError, _PollingRestart):
+                        pass
+                await self._graceful_shutdown()
 
-            # run_polling() returned normally — check uptime to detect crash loops
-            uptime = time.time() - start_time
-            if uptime < self._MIN_UPTIME:
-                rapid_crash_count += 1
-                if rapid_crash_count >= self._MAX_RAPID_CRASHES:
-                    raise SystemExit(
-                        f"❌ Polling exited {self._MAX_RAPID_CRASHES} times within "
-                        f"{self._MIN_UPTIME}s each. Giving up."
-                    )
-                logger.warning(
-                    "Polling exited after only %.1fs (crash %d/%d), restarting in %ds...",
-                    uptime,
-                    rapid_crash_count,
-                    self._MAX_RAPID_CRASHES,
-                    config.network_retry_delay,
+        logger.info("Bot stopped")
+
+    async def _polling_watchdog(self, stop_event: asyncio.Event):
+        """Monitor Telegram API reachability; restart polling if hung."""
+        consecutive_failures = 0
+
+        while not stop_event.is_set():
+            await asyncio.sleep(self._WATCHDOG_INTERVAL)
+
+            if not self.application or not self.application.updater.running:
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    self.application.bot.get_me(), timeout=10
                 )
-            else:
-                rapid_crash_count = 0
-                logger.warning("Polling exited after %.1fs, restarting...", uptime)
+                if consecutive_failures > 0:
+                    logger.info(
+                        "Telegram API reachable again after %d failure(s)",
+                        consecutive_failures,
+                    )
+                consecutive_failures = 0
+            except Exception as e:
+                consecutive_failures += 1
+                total_down = consecutive_failures * self._WATCHDOG_INTERVAL
+                logger.warning(
+                    "Telegram API unreachable (%ds): %s", total_down, e
+                )
 
-            time.sleep(config.network_retry_delay)
-            self.application = None  # force rebuild for clean state
+                if total_down >= self._NETWORK_FAILURE_THRESHOLD:
+                    logger.warning(
+                        "Network down for %ds, restarting polling...",
+                        total_down,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self.application.updater.stop(), timeout=15
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "updater.stop() timed out, forcing process exit"
+                        )
+                        os._exit(1)
+                    raise _PollingRestart()
+
+    async def _wait_for_polling_exit(self, stop_event: asyncio.Event):
+        """Block until stop signal or polling exits unexpectedly."""
+        while not stop_event.is_set():
+            if (
+                self.application
+                and self.application.updater
+                and not self.application.updater.running
+            ):
+                logger.warning(
+                    "Polling exited unexpectedly, triggering restart"
+                )
+                raise _PollingRestart()
+            await asyncio.sleep(1)
+
+    async def _graceful_shutdown(self):
+        """Tear down the current Application so the next loop iteration is clean."""
+        if not self.application:
+            return
+        try:
+            if self.application.updater and self.application.updater.running:
+                await self.application.updater.stop()
+            if self.application.running:
+                await self.application.stop()
+            await self.application.shutdown()
+        except Exception:
+            logger.exception("Error during graceful shutdown")
+        self.application = None
 
     def _check_user_access(self, user_id: int) -> bool:
         """Check if user has permission to use the bot"""

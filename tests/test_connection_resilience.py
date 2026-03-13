@@ -1,7 +1,8 @@
 """Tests for Telegram bot connection resilience after system sleep."""
 # ruff: noqa: E402
+import asyncio
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
 import sys
 import types
@@ -33,7 +34,7 @@ config_module.config = types.SimpleNamespace(
 sys.modules["telegram_bot.utils.config"] = config_module
 
 import telegram.error
-from telegram_bot.core.bot import TelegramBot
+from telegram_bot.core.bot import TelegramBot, _PollingRestart
 
 
 class TestConnectionResilience(unittest.TestCase):
@@ -46,41 +47,71 @@ class TestConnectionResilience(unittest.TestCase):
     @patch('telegram_bot.core.bot.Application')
     def test_builder_configures_timeouts(self, mock_app_class):
         """Test that Application.builder() configures proper timeout values."""
-        # Setup mock builder chain
         mock_builder = Mock()
         mock_app_class.builder.return_value = mock_builder
 
-        # Make builder methods return self for chaining
         mock_builder.token.return_value = mock_builder
         mock_builder.concurrent_updates.return_value = mock_builder
         mock_builder.get_updates_read_timeout.return_value = mock_builder
         mock_builder.get_updates_connect_timeout.return_value = mock_builder
         mock_builder.get_updates_pool_timeout.return_value = mock_builder
-        mock_builder.post_init.return_value = mock_builder
         mock_builder.build.return_value = Mock()
 
         self.bot.build()
 
-        # Verify timeout methods were called with proper values
         mock_builder.get_updates_read_timeout.assert_called_once_with(30)
         mock_builder.get_updates_connect_timeout.assert_called_once_with(10)
         mock_builder.get_updates_pool_timeout.assert_called_once_with(5)
 
-    @patch('time.sleep')
-    def test_network_error_retries_with_rebuild(self, mock_sleep):
-        """Test that NetworkError triggers application rebuild and retry."""
+    def test_invalid_token_raises_system_exit(self):
+        """Test that InvalidToken during initialize raises SystemExit."""
         mock_app = Mock()
-        call_count = 0
+        mock_app.initialize = AsyncMock(
+            side_effect=telegram.error.InvalidToken("bad token")
+        )
 
-        def mock_run_polling(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise telegram.error.NetworkError("Connection reset")
-            # Exit cleanly on second call
-            raise telegram.error.InvalidToken("test exit")
+        self.bot.application = mock_app
+        self.bot.build = Mock()
 
-        mock_app.run_polling = Mock(side_effect=mock_run_polling)
+        with self.assertRaises(SystemExit):
+            self.bot.run()
+
+    def test_conflict_raises_system_exit(self):
+        """Test that Conflict during initialize raises SystemExit."""
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock(
+            side_effect=telegram.error.Conflict("duplicate")
+        )
+
+        self.bot.application = mock_app
+        self.bot.build = Mock()
+
+        with self.assertRaises(SystemExit):
+            self.bot.run()
+
+    @patch('time.time')
+    def test_rapid_restart_triggers_system_exit(self, mock_time):
+        """Test that repeated rapid polling restarts trigger SystemExit."""
+        # Each _run_async iteration: time() at start, time() in _PollingRestart handler
+        # Return incrementing values so uptime is always 1s (< MIN_UPTIME=30)
+        mock_time.side_effect = list(range(100))
+
+        mock_app = Mock()
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+
+        mock_updater = Mock()
+        mock_updater.start_polling = AsyncMock()
+        # Polling immediately "exits" to trigger _PollingRestart
+        type(mock_updater).running = PropertyMock(return_value=False)
+        mock_updater.stop = AsyncMock()
+        mock_app.updater = mock_updater
+        type(mock_app).running = PropertyMock(return_value=True)
+        mock_app.stop = AsyncMock()
+        mock_app.shutdown = AsyncMock()
+        mock_app.bot = Mock()
+
+        self.bot._on_ready = AsyncMock()
 
         build_count = 0
         def mock_build():
@@ -91,36 +122,10 @@ class TestConnectionResilience(unittest.TestCase):
         self.bot.build = mock_build
         self.bot.application = mock_app
 
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as ctx:
             self.bot.run()
 
-        # NetworkError triggered rebuild and retry
-        self.assertEqual(call_count, 2)
-        self.assertGreaterEqual(build_count, 1)
-        mock_sleep.assert_called_with(5)
-
-    @patch('time.sleep')
-    @patch('time.time')
-    def test_rapid_crash_triggers_system_exit(self, mock_time, mock_sleep):
-        """Test that repeated rapid polling exits trigger SystemExit."""
-        # Each iteration calls time.time() twice: before and after run_polling
-        # Uptime of 1s each (< MIN_UPTIME=30) counts as rapid crash
-        mock_time.side_effect = list(range(20))
-
-        mock_app = Mock()
-        mock_app.run_polling = Mock()  # returns normally (simulates graceful shutdown)
-
-        def mock_build():
-            self.bot.application = mock_app
-
-        self.bot.build = mock_build
-        self.bot.application = mock_app
-
-        with self.assertRaises(SystemExit):
-            self.bot.run()
-
-        # Should exit after MAX_RAPID_CRASHES (5) consecutive rapid exits
-        self.assertEqual(mock_app.run_polling.call_count, 5)
+        self.assertIn("Giving up", str(ctx.exception))
 
 
 if __name__ == '__main__':
