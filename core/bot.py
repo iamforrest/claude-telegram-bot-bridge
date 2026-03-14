@@ -34,6 +34,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import BaseRequest, HTTPXRequest
 from telegram_bot.utils.config import config
 from telegram_bot.session.manager import session_manager
 from telegram_bot.core.project_chat import (
@@ -123,10 +124,21 @@ class TelegramBot:
             .get_updates_read_timeout(30)
             .get_updates_connect_timeout(10)
             .get_updates_pool_timeout(5)
+            .request(self._build_default_request())
             .build()
         )
         self._setup_handlers()
         self.application.add_error_handler(self._error_handler)
+
+    def _build_default_request(self) -> BaseRequest:
+        """Build default request for all non-getUpdates API calls."""
+        return HTTPXRequest(
+            connection_pool_size=8,
+            pool_timeout=3.0,
+            read_timeout=10.0,
+            write_timeout=10.0,
+            connect_timeout=5.0,
+        )
 
     _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
     _MAX_RAPID_CRASHES = 5

@@ -2,13 +2,14 @@
 Streaming message handler for progressive draft message updates.
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, List
 
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 
 from telegram_bot.utils.config import config
 
@@ -49,6 +50,18 @@ class StreamingMessageHandler:
         self._draft_seq += 1
         return f"{self.user_id}-{int(time.time() * 1000)}-{self._draft_seq}"
 
+    async def _retry_with_backoff(self, operation, max_retries=3):
+        """Execute operation with exponential backoff on flood control errors."""
+        for attempt in range(max_retries):
+            try:
+                return await operation()
+            except RetryAfter as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait_time = float(e.retry_after) if hasattr(e, 'retry_after') else (2 ** attempt)
+                logger.warning(f"Rate limited, waiting {wait_time}s (retry {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+
     @staticmethod
     def _extract_message_id(message: Any) -> Optional[int]:
         message_id = getattr(message, "message_id", None)
@@ -62,11 +75,11 @@ class StreamingMessageHandler:
         """Send initial draft message"""
         content = text or "..."
         try:
-            # Use regular send_message to get message_id for subsequent edits
-            # send_message_draft returns bool and doesn't provide message_id
-            sent_message = await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=content,
+            sent_message = await self._retry_with_backoff(
+                lambda: self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=content,
+                )
             )
             message_id = self._extract_message_id(sent_message)
             if message_id is None:
@@ -96,8 +109,10 @@ class StreamingMessageHandler:
     async def update_draft(self, draft: DraftState, new_text: str) -> bool:
         """Update existing draft with new text"""
         try:
-            await self.bot.edit_message_text(
-                chat_id=self.chat_id, message_id=draft.message_id, text=new_text
+            await self._retry_with_backoff(
+                lambda: self.bot.edit_message_text(
+                    chat_id=self.chat_id, message_id=draft.message_id, text=new_text
+                )
             )
             draft.text = new_text
             draft.last_update_time = time.time()
@@ -124,8 +139,10 @@ class StreamingMessageHandler:
     async def finalize_draft(self, draft: DraftState) -> bool:
         """Convert draft to regular message"""
         try:
-            await self.bot.edit_message_text(
-                chat_id=self.chat_id, message_id=draft.message_id, text=draft.text
+            await self._retry_with_backoff(
+                lambda: self.bot.edit_message_text(
+                    chat_id=self.chat_id, message_id=draft.message_id, text=draft.text
+                )
             )
             logger.debug(f"Finalized draft {draft.message_id}")
             return True
@@ -280,8 +297,10 @@ class StreamingMessageHandler:
         # Delete all draft messages
         for draft in self.drafts:
             try:
-                await self.bot.delete_message(
-                    chat_id=self.chat_id, message_id=draft.message_id
+                await self._retry_with_backoff(
+                    lambda: self.bot.delete_message(
+                        chat_id=self.chat_id, message_id=draft.message_id
+                    )
                 )
                 logger.debug(f"Deleted draft {draft.message_id}")
             except TelegramError as e:
