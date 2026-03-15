@@ -53,6 +53,12 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 - **ffmpeg** — 语音格式转换必需
 - **OpenAI API Key** — Whisper 转写必需（`OPENAI_API_KEY`）
 
+## 平台支持
+
+- **macOS** — 完整支持，包含 `--install` / `--uninstall`
+- **WSL（Ubuntu/Debian 风格 Linux 用户态）** — 支持前台运行、`--daemon`、`--status`、`--stop`
+- **原生 Windows（PowerShell / CMD）** — 不支持
+
 ## 快速开始
 
 ```bash
@@ -99,8 +105,8 @@ cd claude-telegram-bot-bridge
 ./start.sh --path /path/to/project --status     # 查看状态
 ./start.sh --path /path/to/project --stop       # 停止
 ./start.sh --path /path/to/project --upgrade    # 更新到最新版本
-./start.sh --path /path/to/project --install    # 安装为 macOS 开机自启服务
-./start.sh --path /path/to/project --uninstall  # 移除开机自启服务
+./start.sh --path /path/to/project --install    # 仅 macOS：安装开机自启服务
+./start.sh --path /path/to/project --uninstall  # 仅 macOS：移除开机自启服务
 ```
 
 ## 使用场景
@@ -291,8 +297,7 @@ Claude:  ...
 启用语音消息前请先安装 ffmpeg：
 
 - macOS (Homebrew): `brew install ffmpeg`
-- Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
-- Windows (winget): `winget install --id Gyan.FFmpeg -e`
+- Ubuntu/Debian 或 WSL: `sudo apt-get update && sudo apt-get install -y ffmpeg`
 
 安装后可验证：
 
@@ -317,8 +322,8 @@ ffmpeg -version
 ```bash
 ./start.sh --path /path/to/project --status       # 查看运行状态
 ./start.sh --path /path/to/project --stop         # 停止
-./start.sh --path /path/to/project --install      # macOS launchd 开机自启
-./start.sh --path /path/to/project --uninstall    # 移除开机自启
+./start.sh --path /path/to/project --install      # 仅 macOS：launchd 开机自启
+./start.sh --path /path/to/project --uninstall    # 仅 macOS：移除开机自启
 ```
 
 守护进程崩溃后自动重启，每次崩溃记录退出码和运行时间，60 秒内连续崩溃 5 次后停止重启。

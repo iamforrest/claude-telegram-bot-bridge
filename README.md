@@ -53,6 +53,12 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 - **ffmpeg** — required for audio format conversion
 - **OpenAI API Key** — required for Whisper transcription (`OPENAI_API_KEY`)
 
+## Platform Support
+
+- **macOS** — fully supported, including `--install` / `--uninstall`
+- **WSL (Ubuntu/Debian-style Linux userland)** — supported for foreground run, `--daemon`, `--status`, and `--stop`
+- **Native Windows (PowerShell / CMD)** — not supported
+
 ## Quick Start
 
 ```bash
@@ -99,8 +105,8 @@ Then start the bot:
 ./start.sh --path /path/to/project --status     # Check status
 ./start.sh --path /path/to/project --stop       # Stop
 ./start.sh --path /path/to/project --upgrade    # Update to latest version
-./start.sh --path /path/to/project --install    # Install as macOS startup service
-./start.sh --path /path/to/project --uninstall  # Remove startup service
+./start.sh --path /path/to/project --install    # macOS only: install startup service
+./start.sh --path /path/to/project --uninstall  # macOS only: remove startup service
 ```
 
 ## Usage Examples
@@ -293,8 +299,7 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 Install ffmpeg before enabling voice messages:
 
 - macOS (Homebrew): `brew install ffmpeg`
-- Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y ffmpeg`
-- Windows (winget): `winget install --id Gyan.FFmpeg -e`
+- Ubuntu/Debian or WSL: `sudo apt-get update && sudo apt-get install -y ffmpeg`
 
 Then verify:
 
@@ -319,8 +324,8 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 ```bash
 ./start.sh --path /path/to/project --status       # Check if running
 ./start.sh --path /path/to/project --stop         # Stop
-./start.sh --path /path/to/project --install      # macOS launchd auto-start on boot
-./start.sh --path /path/to/project --uninstall    # Remove auto-start
+./start.sh --path /path/to/project --install      # macOS only: launchd auto-start on boot
+./start.sh --path /path/to/project --uninstall    # macOS only: remove auto-start
 ```
 
 The daemon auto-restarts on crash, logs each crash with exit code and uptime, and stops restarting after 5 rapid crashes in 60 seconds.

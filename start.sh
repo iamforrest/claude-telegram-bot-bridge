@@ -247,17 +247,27 @@ do_status() {
         exit 0
     fi
     if kill -0 "$pid" 2>/dev/null; then
+        local heartbeat_file="$BOT_DATA_DIR/bot.heartbeat"
         local bot_log="$LOGS_DIR/bot.log"
+        local activity_file activity_label
         local now mtime age_seconds age_minutes
         local inactive_after_seconds="${STATUS_INACTIVE_SECONDS:-900}"
 
-        if [ ! -f "$bot_log" ]; then
-            echo "🔴 Bot status: unavailable (PID: $pid, bot.log missing; common causes: startup did not complete, log path/permission issue)"
+        if [ -f "$heartbeat_file" ]; then
+            activity_file="$heartbeat_file"
+            activity_label="heartbeat"
+        else
+            activity_file="$bot_log"
+            activity_label="log update"
+        fi
+
+        if [ ! -f "$activity_file" ]; then
+            echo "🔴 Bot status: unavailable (PID: $pid, activity file missing; common causes: startup did not complete, log/heartbeat path issue)"
             exit 2
         fi
 
         now="$(date +%s)"
-        mtime="$(get_mtime_epoch "$bot_log")"
+        mtime="$(get_mtime_epoch "$activity_file")"
         if [ -z "$mtime" ] || [ "$mtime" -gt "$now" ]; then
             echo "🔴 Bot status: unavailable (PID: $pid, invalid log timestamp; common causes: filesystem clock/mtime anomaly)"
             exit 2
@@ -270,7 +280,7 @@ do_status() {
             exit 2
         fi
 
-        echo "🟢 Bot status: running (PID: $pid, last log update ${age_seconds}s ago)"
+        echo "🟢 Bot status: running (PID: $pid, last ${activity_label} ${age_seconds}s ago)"
     else
         echo "🔴 Bot status: unavailable (stale PID: $pid; common causes: process crashed/exited, stale pid file cleanup failed)"
         cleanup_pid
@@ -320,6 +330,38 @@ read_env_value() {
     value="${value%\'}"
     value="${value#\'}"
     echo "$value"
+}
+
+upsert_env_value() {
+    local key="$1"
+    local value="$2"
+    local file="$3"
+    local tmp_file
+
+    tmp_file="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+
+    if awk -v key="$key" -v value="$value" '
+        BEGIN { updated = 0 }
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            if (!updated) {
+                print key "=" value
+                updated = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print key "=" value
+            }
+        }
+    ' "$file" > "$tmp_file"; then
+        mv "$tmp_file" "$file"
+        return 0
+    fi
+
+    rm -f "$tmp_file"
+    return 1
 }
 
 _is_valid_token() {
@@ -375,10 +417,9 @@ check_env() {
             echo "❌ Token cannot be empty. Please re-run and enter a valid token."
             exit 1
         fi
-        if grep -q "^TELEGRAM_BOT_TOKEN=" "$ENV_FILE"; then
-            sed -i '' "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${INPUT_TOKEN}|" "$ENV_FILE"
-        else
-            echo "TELEGRAM_BOT_TOKEN=${INPUT_TOKEN}" >> "$ENV_FILE"
+        if ! upsert_env_value "TELEGRAM_BOT_TOKEN" "$INPUT_TOKEN" "$ENV_FILE"; then
+            echo "❌ Failed to save token to $ENV_FILE"
+            exit 1
         fi
         echo "✅ Token saved to $ENV_FILE"
         echo ""

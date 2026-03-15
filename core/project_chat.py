@@ -78,6 +78,8 @@ _RETRYABLE_PATTERNS = [
     "exit code -9",  # SIGKILL
     "ConnectionRefused",
     "Unable to connect to API",
+    "Control request timeout",  # SDK initialization timeout
+    "TimeoutError",  # Generic timeout errors
 ]
 
 
@@ -641,15 +643,27 @@ class ProjectChatHandler:
                     pass
 
             err = str(e)
+            logger.error(
+                f"SDK error for user {user_id}: {err} (type: {type(e).__name__})",
+                exc_info=True
+            )
 
             # Retry once for transient SDK errors (SIGTERM, ConnectionRefused, etc.)
-            if _is_retryable_sdk_error(err):
+            is_retryable = _is_retryable_sdk_error(err)
+            logger.info(
+                f"Error retryability check for user {user_id}: "
+                f"is_retryable={is_retryable}, error='{err[:100]}...'"
+            )
+
+            if is_retryable:
                 logger.warning(
                     "Retryable SDK error for user %s: %s — reconnecting and retrying",
                     user_id,
                     err,
                 )
+                logger.info(f"Disconnecting stream for user {user_id} before retry...")
                 await self._disconnect_user_stream(user_id)
+                logger.info(f"Stream disconnected for user {user_id}, creating retry request...")
 
                 retry_future: asyncio.Future = loop.create_future()
                 retry_handler = None
@@ -679,10 +693,8 @@ class ProjectChatHandler:
                         await retry_state.client.query(
                             user_message, session_id=retry_request.sent_session_id
                         )
-                        logger.info("Retry submitted for user %s", user_id)
-                    return await asyncio.wait_for(
-                        retry_future, timeout=PROCESS_TIMEOUT
-                    )
+                        logger.info("✅ Retry submitted successfully for user %s after reconnection", user_id)
+                    return await asyncio.wait_for(retry_future, timeout=PROCESS_TIMEOUT)
                 except Exception as retry_err:
                     logger.error(
                         "Retry also failed for user %s: %s",
