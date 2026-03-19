@@ -6,7 +6,6 @@ import platform
 import re
 import shlex
 import signal
-import socket
 import time
 from pathlib import Path as FilePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -121,9 +120,7 @@ class TelegramBot:
             Application.builder()
             .token(config.telegram_bot_token)
             .concurrent_updates(True)
-            .get_updates_read_timeout(30)
-            .get_updates_connect_timeout(10)
-            .get_updates_pool_timeout(5)
+            .get_updates_request(self._build_get_updates_request())
             .request(self._build_default_request())
             .build()
         )
@@ -132,12 +129,36 @@ class TelegramBot:
 
     def _build_default_request(self) -> BaseRequest:
         """Build default request for all non-getUpdates API calls."""
+        proxy_url = (
+            os.environ.get("PROXY_URL")
+            or os.environ.get("https_proxy")
+            or os.environ.get("http_proxy")
+        )
         return HTTPXRequest(
             connection_pool_size=8,
             pool_timeout=3.0,
             read_timeout=10.0,
             write_timeout=10.0,
             connect_timeout=5.0,
+            proxy=proxy_url,
+            http_version="1.1",
+        )
+
+    def _build_get_updates_request(self) -> BaseRequest:
+        """Build dedicated request for getUpdates polling."""
+        proxy_url = (
+            os.environ.get("PROXY_URL")
+            or os.environ.get("https_proxy")
+            or os.environ.get("http_proxy")
+        )
+        return HTTPXRequest(
+            connection_pool_size=2,
+            pool_timeout=5.0,
+            read_timeout=35.0,
+            write_timeout=10.0,
+            connect_timeout=5.0,
+            proxy=proxy_url,
+            http_version="1.1",
         )
 
     _MIN_UPTIME = 30  # seconds — polling exits faster → count as crash
@@ -184,7 +205,9 @@ class TelegramBot:
                     "   Use --stop to stop it first, or check for duplicate processes."
                 )
             except telegram.error.NetworkError as e:
-                logger.warning("Network error during initialization: %s, retrying...", e)
+                logger.warning(
+                    "Network error during initialization: %s, retrying...", e
+                )
                 await asyncio.sleep(5)
                 continue
 
@@ -195,14 +218,12 @@ class TelegramBot:
                 await self.application.start()
                 await self.application.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
+                    drop_pending_updates=True,
                 )
 
                 logger.info("Bot is running")
 
-                watchdog_task = asyncio.create_task(
-                    self._polling_watchdog(stop_event)
-                )
+                watchdog_task = asyncio.create_task(self._polling_watchdog(stop_event))
 
                 await self._wait_for_polling_exit(stop_event)
 
@@ -252,13 +273,12 @@ class TelegramBot:
         while not stop_event.is_set():
             await asyncio.sleep(self._WATCHDOG_INTERVAL)
 
-            if not self.application or not self.application.updater.running:
+            updater = self.application.updater if self.application else None
+            if not self.application or not updater or not updater.running:
                 continue
 
             try:
-                await asyncio.wait_for(
-                    self.application.bot.get_me(), timeout=10
-                )
+                await asyncio.wait_for(self.application.bot.get_me(), timeout=10)
                 if consecutive_failures > 0:
                     logger.info(
                         "Telegram API reachable again after %d failure(s)",
@@ -268,9 +288,7 @@ class TelegramBot:
             except Exception as e:
                 consecutive_failures += 1
                 total_down = consecutive_failures * self._WATCHDOG_INTERVAL
-                logger.warning(
-                    "Telegram API unreachable (%ds): %s", total_down, e
-                )
+                logger.warning("Telegram API unreachable (%ds): %s", total_down, e)
 
                 if total_down >= self._NETWORK_FAILURE_THRESHOLD:
                     logger.warning(
@@ -278,13 +296,9 @@ class TelegramBot:
                         total_down,
                     )
                     try:
-                        await asyncio.wait_for(
-                            self.application.updater.stop(), timeout=15
-                        )
+                        await asyncio.wait_for(updater.stop(), timeout=15)
                     except asyncio.TimeoutError:
-                        logger.error(
-                            "updater.stop() timed out, forcing process exit"
-                        )
+                        logger.error("updater.stop() timed out, forcing process exit")
                         os._exit(1)
                     raise _PollingRestart()
 
@@ -296,9 +310,7 @@ class TelegramBot:
                 and self.application.updater
                 and not self.application.updater.running
             ):
-                logger.warning(
-                    "Polling exited unexpectedly, triggering restart"
-                )
+                logger.warning("Polling exited unexpectedly, triggering restart")
                 raise _PollingRestart()
             await asyncio.sleep(1)
 

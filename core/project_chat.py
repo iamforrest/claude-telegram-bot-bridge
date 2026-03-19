@@ -73,6 +73,7 @@ ALLOWED_TOOLS = [
 
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600"))
 
+
 def _is_retryable_sdk_error(error: Exception) -> bool:
     """Check if the SDK error is transient and worth retrying.
 
@@ -118,7 +119,7 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
         "refused",
         "unreachable",
         "exit code -15",  # SIGTERM
-        "exit code -9",   # SIGKILL
+        "exit code -9",  # SIGKILL
     ]
 
     return any(pattern in error_msg.lower() for pattern in RETRYABLE_MSG_PATTERNS)
@@ -681,7 +682,7 @@ class ProjectChatHandler:
             err = str(e)
             logger.error(
                 f"SDK error for user {user_id}: {err} (type: {type(e).__name__})",
-                exc_info=True
+                exc_info=True,
             )
 
             # Retry once for transient SDK errors (network/timeout errors)
@@ -699,7 +700,9 @@ class ProjectChatHandler:
                 )
                 logger.info(f"Disconnecting stream for user {user_id} before retry...")
                 await self._disconnect_user_stream(user_id)
-                logger.info(f"Stream disconnected for user {user_id}, creating retry request...")
+                logger.info(
+                    f"Stream disconnected for user {user_id}, creating retry request..."
+                )
 
                 retry_future: asyncio.Future = loop.create_future()
                 retry_handler = None
@@ -729,7 +732,10 @@ class ProjectChatHandler:
                         await retry_state.client.query(
                             user_message, session_id=retry_request.sent_session_id
                         )
-                        logger.info("✅ Retry submitted successfully for user %s after reconnection", user_id)
+                        logger.info(
+                            "✅ Retry submitted successfully for user %s after reconnection",
+                            user_id,
+                        )
                     return await asyncio.wait_for(retry_future, timeout=PROCESS_TIMEOUT)
                 except Exception as retry_err:
                     logger.error(

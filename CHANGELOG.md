@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] - 2026-03-20
+
+### Fixed
+- Use dedicated HTTPX request settings for Telegram polling with HTTP/1.1 and proxy propagation, improving reliability after network changes and proxyed deployments
+- Drop stale pending updates on polling restart so the bot resumes with fresh messages after recovery
+- Preserve `PATH` and `HOME` in the generated macOS launchd plist so startup service launches reliably outside interactive shells
+
+### Changed
+- Updated README documentation for launchd startup behavior and proxy-aware connection recovery
+
 ## [0.8.5] - 2026-03-13
 
 ### Fixed

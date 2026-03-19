@@ -58,8 +58,12 @@ class StreamingMessageHandler:
             except RetryAfter as e:
                 if attempt == max_retries - 1:
                     raise
-                wait_time = float(e.retry_after) if hasattr(e, 'retry_after') else (2 ** attempt)
-                logger.warning(f"Rate limited, waiting {wait_time}s (retry {attempt + 1}/{max_retries})")
+                wait_time = (
+                    float(e.retry_after) if hasattr(e, "retry_after") else (2**attempt)
+                )
+                logger.warning(
+                    f"Rate limited, waiting {wait_time}s (retry {attempt + 1}/{max_retries})"
+                )
                 await asyncio.sleep(wait_time)
 
     @staticmethod

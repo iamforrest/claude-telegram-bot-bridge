@@ -1,7 +1,6 @@
 """Tests for Telegram bot connection resilience after system sleep."""
 
 # ruff: noqa: E402
-import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
@@ -70,65 +69,58 @@ class TestConnectionResilience(unittest.TestCase):
         self.bot = TelegramBot()
 
     @patch.object(bot_module, "Application")
-    def test_builder_configures_timeouts(self, mock_app_class):
-        """Test that Application.builder() tracks getUpdates activity with custom request."""
+    @patch.object(bot_module, "HTTPXRequest", side_effect=lambda **kwargs: kwargs)
+    def test_builder_configures_timeouts(self, mock_httpx_request, mock_app_class):
+        """Application.builder() should use dedicated HTTPX requests for polling and API calls."""
         mock_builder = Mock()
         mock_app_class.builder.return_value = mock_builder
 
         mock_builder.token.return_value = mock_builder
         mock_builder.concurrent_updates.return_value = mock_builder
         mock_builder.get_updates_request.return_value = mock_builder
+        mock_builder.request.return_value = mock_builder
         mock_builder.build.return_value = Mock()
 
         self.bot.build()
 
+        self.assertEqual(mock_httpx_request.call_count, 2)
         mock_builder.get_updates_request.assert_called_once()
-        tracked_request = mock_builder.get_updates_request.call_args.args[0]
-        self.assertIsInstance(tracked_request, bot_module._ActivityTrackingRequest)
-        self.assertIsInstance(tracked_request._wrapped, bot_module.HTTPXRequest)
-        self.assertEqual(
-            tracked_request._wrapped.read_timeout,
-            self.bot._GET_UPDATES_READ_TIMEOUT,
-        )
+        polling_request = mock_builder.get_updates_request.call_args.args[0]
+        default_request = mock_builder.request.call_args.args[0]
 
-    def test_activity_tracking_request_records_start_and_finish(self):
-        """The request wrapper should emit activity before and after getUpdates."""
+        self.assertEqual(polling_request["connection_pool_size"], 2)
+        self.assertEqual(polling_request["read_timeout"], 35.0)
+        self.assertEqual(polling_request["pool_timeout"], 5.0)
+        self.assertEqual(polling_request["http_version"], "1.1")
 
-        class DummyRequest(bot_module.BaseRequest):
-            @property
-            def read_timeout(self):
-                return 1.0
+        self.assertEqual(default_request["connection_pool_size"], 8)
+        self.assertEqual(default_request["read_timeout"], 10.0)
+        self.assertEqual(default_request["pool_timeout"], 3.0)
+        self.assertEqual(default_request["http_version"], "1.1")
 
-            async def initialize(self):
-                return None
+    @patch.dict(
+        os.environ,
+        {
+            "PROXY_URL": "http://proxy.example:8080",
+            "https_proxy": "",
+            "http_proxy": "",
+        },
+        clear=False,
+    )
+    def test_request_builders_use_proxy_and_http11(self):
+        """Both request builders should honor proxy settings and force HTTP/1.1."""
+        with patch.object(
+            bot_module,
+            "HTTPXRequest",
+            side_effect=lambda **kwargs: kwargs,
+        ):
+            default_request = self.bot._build_default_request()
+            polling_request = self.bot._build_get_updates_request()
 
-            async def shutdown(self):
-                return None
-
-            async def do_request(
-                self,
-                url,
-                method,
-                request_data=None,
-                read_timeout=bot_module.BaseRequest.DEFAULT_NONE,
-                write_timeout=bot_module.BaseRequest.DEFAULT_NONE,
-                connect_timeout=bot_module.BaseRequest.DEFAULT_NONE,
-                pool_timeout=bot_module.BaseRequest.DEFAULT_NONE,
-            ):
-                return 200, b"{}"
-
-        activity_ticks: list[str] = []
-        tracked_request = bot_module._ActivityTrackingRequest(
-            DummyRequest(),
-            lambda: activity_ticks.append("tick"),
-            label="getUpdates",
-        )
-
-        async def run():
-            await tracked_request.do_request("https://example.com", "POST")
-
-        asyncio.run(run())
-        self.assertEqual(activity_ticks, ["tick", "tick"])
+        self.assertEqual(default_request["proxy"], "http://proxy.example:8080")
+        self.assertEqual(default_request["http_version"], "1.1")
+        self.assertEqual(polling_request["proxy"], "http://proxy.example:8080")
+        self.assertEqual(polling_request["http_version"], "1.1")
 
     def test_invalid_token_raises_system_exit(self):
         """Test that InvalidToken during initialize raises SystemExit."""
@@ -190,10 +182,7 @@ class TestConnectionResilience(unittest.TestCase):
 
         _, kwargs = mock_updater.start_polling.call_args
         self.assertEqual(kwargs["allowed_updates"], Update.ALL_TYPES)
-        self.assertFalse(kwargs["drop_pending_updates"])
-        error_callback = kwargs["error_callback"]
-        self.assertIs(error_callback.__self__, self.bot)
-        self.assertIs(error_callback.__func__, TelegramBot._polling_error_callback)
+        self.assertTrue(kwargs["drop_pending_updates"])
 
     @patch("time.time")
     def test_rapid_restart_triggers_system_exit(self, mock_time):
@@ -229,9 +218,8 @@ class TestConnectionResilience(unittest.TestCase):
         self.bot.build = mock_build
         self.bot.application = mock_app
 
-        with patch.object(self.bot, "_arm_hard_exit"):
-            with self.assertRaises(SystemExit) as ctx:
-                self.bot.run()
+        with self.assertRaises(SystemExit) as ctx:
+            self.bot.run()
 
         self.assertIn("Giving up", str(ctx.exception))
 

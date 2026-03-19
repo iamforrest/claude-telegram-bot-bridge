@@ -39,11 +39,12 @@ Claude Code 很强大，但它绑定在你的终端里。当你离开电脑 — 
 
 **运维**
 - 守护进程模式，崩溃自动重启（60 秒内连续崩溃 5 次则停止）
-- 一条命令安装 macOS launchd 开机自启（`--install`）
+- 一条命令安装 macOS launchd 开机自启（`--install`），并保留 `PATH`/`HOME`
 - 启动时自动检测更新 — 有新版本时提示
 - 一条命令升级（`--upgrade`）— 拉取最新代码并重装依赖
 - 基于 MD5 的依赖缓存 — `requirements.txt` 未变则跳过安装
 - 自动创建 venv、14 天日志自动清理、崩溃日志含退出码
+- 轮询使用独立 HTTP 客户端，并继承代理与 HTTP/1.1 配置，网络切换后恢复更稳定
 
 ## 前置条件
 
@@ -206,6 +207,9 @@ Claude:  ...
 # 安装为 macOS 开机自启服务 — 重启后自动恢复
 ./start.sh --path ~/my-project --install
 
+# 生成的 launchd plist 会保留 PATH 和 HOME
+# 开机启动时也能正确找到 Claude CLI 和代理配置
+
 # 随时查看状态
 ./start.sh --path ~/my-project --status
 # 🟢 Bot is running (PID: 12345)
@@ -327,6 +331,8 @@ ffmpeg -version
 ```
 
 守护进程崩溃后自动重启，每次崩溃记录退出码和运行时间，60 秒内连续崩溃 5 次后停止重启。
+
+如果设置了 `PROXY_URL`，普通 Bot API 调用和长轮询都会使用支持代理的 HTTP/1.1 客户端。这让 Bot 在电脑休眠恢复、网络切换或代理重连后更容易自动恢复。
 
 ## 调试
 

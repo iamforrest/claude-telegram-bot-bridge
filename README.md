@@ -39,11 +39,12 @@ This bot takes a different approach — **lightweight, zero-infrastructure, secu
 
 **Operations**
 - Daemon mode with auto-restart on crash (stops after 5 rapid crashes in 60s)
-- One-command macOS launchd auto-start on boot (`--install`)
+- One-command macOS launchd auto-start on boot (`--install`) with inherited `PATH`/`HOME`
 - Auto-update check on startup — notifies when new version available
 - One-command upgrade (`--upgrade`) — pulls latest code and reinstalls dependencies
 - MD5-based dependency caching — skips reinstall when `requirements.txt` is unchanged
 - Auto venv creation, 14-day log rotation, crash logging with exit codes
+- Dedicated polling HTTP client with proxy-aware HTTP/1.1 settings for better recovery after network changes
 
 ## Prerequisites
 
@@ -209,6 +210,9 @@ Claude: ...
 # Install as macOS startup service — survives reboots
 ./start.sh --path ~/my-project --install
 
+# The generated launchd plist preserves PATH and HOME
+# so Claude CLI and proxy settings still resolve at boot
+
 # Check status anytime
 ./start.sh --path ~/my-project --status
 # 🟢 Bot is running (PID: 12345)
@@ -329,6 +333,8 @@ Current reference pricing is about **$0.006/minute** of audio. Check OpenAI pric
 ```
 
 The daemon auto-restarts on crash, logs each crash with exit code and uptime, and stops restarting after 5 rapid crashes in 60 seconds.
+
+When `PROXY_URL` is set, both regular Bot API calls and long-polling requests use proxy-aware HTTP/1.1 clients. This helps the bot recover more reliably after laptop sleep, network handoffs, or proxy reconnects.
 
 ## Debugging
 

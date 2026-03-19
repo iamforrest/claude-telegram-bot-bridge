@@ -459,12 +459,18 @@ do_install() {
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>-l</string>
         <string>${SCRIPT_DIR}/start.sh</string>
         <string>--path</string>
         <string>${PROJECT_ROOT}</string>
         <string>--_daemon_child</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${PATH}</string>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -546,6 +552,25 @@ do_upgrade() {
     exit 0
 }
 
+# ── Token-based global lock (prevents duplicate instances across different project dirs) ──
+_raw_token="$(read_env_with_fallback "TELEGRAM_BOT_TOKEN")"
+_token_hash="$(printf '%s' "$_raw_token" | md5 -q 2>/dev/null || printf '%s' "$_raw_token" | md5sum | cut -d' ' -f1)"
+TOKEN_LOCK_DIR="$HOME/.telegram-bot-locks"
+TOKEN_LOCK_FILE="$TOKEN_LOCK_DIR/${_token_hash}.pid"
+mkdir -p "$TOKEN_LOCK_DIR"
+unset _raw_token _token_hash
+
+is_token_locked() {
+    [ -f "$TOKEN_LOCK_FILE" ] || return 1
+    local lock_pid
+    lock_pid="$(cat "$TOKEN_LOCK_FILE")"
+    [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null
+}
+
+cleanup_token_lock() {
+    rm -f "$TOKEN_LOCK_FILE"
+}
+
 # ── Dispatch action ──
 
 case "$ACTION" in
@@ -592,25 +617,6 @@ maybe_setup_claude_cli() {
     fi
 }
 check_env
-
-# ── Token-based global lock (prevents duplicate instances across different project dirs) ──
-_raw_token="$(read_env_with_fallback "TELEGRAM_BOT_TOKEN")"
-_token_hash="$(printf '%s' "$_raw_token" | md5 -q 2>/dev/null || printf '%s' "$_raw_token" | md5sum | cut -d' ' -f1)"
-TOKEN_LOCK_DIR="$HOME/.telegram-bot-locks"
-TOKEN_LOCK_FILE="$TOKEN_LOCK_DIR/${_token_hash}.pid"
-mkdir -p "$TOKEN_LOCK_DIR"
-unset _raw_token _token_hash
-
-is_token_locked() {
-    [ -f "$TOKEN_LOCK_FILE" ] || return 1
-    local lock_pid
-    lock_pid="$(cat "$TOKEN_LOCK_FILE")"
-    [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null
-}
-
-cleanup_token_lock() {
-    rm -f "$TOKEN_LOCK_FILE"
-}
 
 # ── Daemon mode handling ──
 

@@ -1,5 +1,6 @@
 import os
 import pty
+import re
 import select
 import shutil
 import subprocess
@@ -51,6 +52,14 @@ class StartStatusTests(unittest.TestCase):
         fake_python = bin_dir / "python3"
         fake_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         fake_python.chmod(0o755)
+
+    def _make_fake_launchctl(self, bin_dir: Path, log_file: Path) -> None:
+        fake_launchctl = bin_dir / "launchctl"
+        fake_launchctl.write_text(
+            f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {str(log_file)!r}\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_launchctl.chmod(0o755)
 
     def _run_interactive_start(
         self,
@@ -216,6 +225,54 @@ class StartStatusTests(unittest.TestCase):
                 "TELEGRAM_BOT_TOKEN = your_bot_token_here",
                 env_contents,
             )
+
+    def test_install_generates_launchd_plist_with_environment_variables(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = self._prepare_project(tmpdir)
+            start_script = self._prepare_script_workspace(tmpdir)
+            (project_root / ".telegram_bot" / ".env").write_text(
+                "TELEGRAM_BOT_TOKEN=123456789:token\n",
+                encoding="utf-8",
+            )
+
+            fake_bin = Path(tmpdir) / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            launchctl_log = Path(tmpdir) / "launchctl.log"
+            self._make_fake_launchctl(fake_bin, launchctl_log)
+
+            fake_home = Path(tmpdir) / "home"
+            env = os.environ.copy()
+            env["HOME"] = str(fake_home)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+            result = subprocess.run(
+                ["bash", str(start_script), str(project_root), "--install"],
+                cwd=start_script.parent,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+
+            project_slug = re.sub(r"[^a-z0-9]+", "-", project_root.name.lower()).rstrip(
+                "-"
+            )
+            plist_file = (
+                fake_home
+                / "Library"
+                / "LaunchAgents"
+                / f"com.telegram-skill-bot.{project_slug}.plist"
+            )
+            plist_contents = plist_file.read_text(encoding="utf-8")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Installed and loaded as startup service", result.stdout)
+            self.assertNotIn("<string>-l</string>", plist_contents)
+            self.assertIn("<key>EnvironmentVariables</key>", plist_contents)
+            self.assertIn(f"<string>{env['PATH']}</string>", plist_contents)
+            self.assertIn(f"<string>{env['HOME']}</string>", plist_contents)
+            self.assertIn("<string>--_daemon_child</string>", plist_contents)
+            self.assertIn("bootstrap", launchctl_log.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
