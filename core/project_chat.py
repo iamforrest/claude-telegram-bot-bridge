@@ -467,6 +467,14 @@ class ProjectChatHandler:
                             if os.environ.get("BOT_DEBUG"):
                                 print(f"\033[36m[Claude]\033[0m {block.text[:200]}")
                         elif isinstance(block, ToolUseBlock):
+                            logger.debug(f"ToolUseBlock: {block.name}")
+                            if req.streaming_handler:
+                                try:
+                                    await req.streaming_handler.add_tool_call(
+                                        block.name, block.input
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Tool call display failed: {e}")
                             if os.environ.get("BOT_DEBUG"):
                                 print(
                                     f"\033[33m[Tool: {block.name}]\033[0m {str(block.input)[:150]}"

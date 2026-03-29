@@ -41,14 +41,68 @@ class StreamingMessageHandler:
         self.user_id = user_id
         self.drafts: List[DraftState] = []
         self.accumulated_text: str = ""
+        self.tool_calls_text: str = ""  # Accumulated tool call display text
         self.min_chars = config.draft_update_min_chars
         self.min_interval = config.draft_update_interval
+        self.enable_tool_calls = getattr(config, "enable_streaming_tool_calls", False)
         self._finalized = False
         self._draft_seq = 0
 
     def _next_draft_id(self) -> str:
         self._draft_seq += 1
         return f"{self.user_id}-{int(time.time() * 1000)}-{self._draft_seq}"
+
+    @staticmethod
+    def _format_tool_call(name: str, input: dict) -> str:
+        """Format tool call for display in Telegram"""
+        # Extract key arguments for summary
+        if name == "Bash" and "command" in input:
+            summary = input["command"]
+        elif name in ("Read", "Write", "Edit", "MultiEdit") and "file_path" in input:
+            summary = input["file_path"]
+        elif name == "Glob" and "pattern" in input:
+            summary = input["pattern"]
+        elif name == "Grep" and "pattern" in input:
+            summary = input["pattern"]
+        elif name == "WebFetch" and "url" in input:
+            summary = input["url"]
+        elif name == "WebSearch" and "query" in input:
+            summary = input["query"]
+        elif name == "Agent" and "subagent_type" in input:
+            summary = input["subagent_type"]
+        elif name == "Task" and "description" in input:
+            summary = input["description"]
+        elif name == "AskUserQuestion":
+            # Extract question text if available
+            if "questions" in input and input["questions"]:
+                summary = input["questions"][0].get("question", "asking...")
+            else:
+                summary = "asking..."
+        else:
+            # Generic: show truncated input
+            summary = str(input)[:80]
+
+        return f"🛠️ **{name}**: `{summary}`\n"
+
+    async def add_tool_call(self, name: str, input: dict) -> bool:
+        """Add a tool call notification to the streaming output"""
+        if self._finalized or not self.enable_tool_calls:
+            return False
+
+        tool_line = self._format_tool_call(name, input)
+        self.tool_calls_text += tool_line
+
+        # Rebuild full text: tool calls prefix + accumulated content
+        full_text = self.tool_calls_text + self.accumulated_text
+
+        # Create or update draft immediately (tool calls are important)
+        if not self.drafts:
+            await self.create_draft(full_text)
+        else:
+            current_draft = self.drafts[-1]
+            await self.update_draft(current_draft, full_text)
+
+        return True
 
     async def _retry_with_backoff(self, operation, max_retries=3):
         """Execute operation with exponential backoff on flood control errors."""
@@ -176,6 +230,10 @@ class StreamingMessageHandler:
         # Hard cut at max_length
         return max_length
 
+    def _first_draft_prefix(self) -> str:
+        """Return tool calls prefix if we're still on the first draft, else empty string."""
+        return self.tool_calls_text if len(self.drafts) <= 1 else ""
+
     async def handle_overflow(self) -> bool:
         """Handle 4000 character boundary by finalizing current draft and creating new one"""
         if not self.drafts:
@@ -185,7 +243,9 @@ class StreamingMessageHandler:
         split_point = self._find_split_boundary(self.accumulated_text)
 
         # Finalize current draft with text up to split point
-        finalize_text = self.accumulated_text[:split_point]
+        # Include tool_calls_text prefix only on the first draft
+        prefix = self._first_draft_prefix()
+        finalize_text = prefix + self.accumulated_text[:split_point]
         current_draft.text = finalize_text
         await self.finalize_draft(current_draft)
 
@@ -229,13 +289,14 @@ class StreamingMessageHandler:
                     chunk_start = chunk_end
                     continue
 
+                display_text = self._first_draft_prefix() + self.accumulated_text
                 # Create first draft if needed
                 if not self.drafts:
-                    await self.create_draft(self.accumulated_text)
+                    await self.create_draft(display_text)
                 else:
                     # Update existing draft
                     current_draft = self.drafts[-1]
-                    await self.update_draft(current_draft, self.accumulated_text)
+                    await self.update_draft(current_draft, display_text)
 
                 chunk_start = chunk_end
             return True
@@ -251,14 +312,16 @@ class StreamingMessageHandler:
             await self.handle_overflow()
             return True
 
+        display_text = self._first_draft_prefix() + self.accumulated_text
+
         # Create first draft if needed
         if not self.drafts:
-            await self.create_draft(self.accumulated_text)
+            await self.create_draft(display_text)
             return True
 
         # Update existing draft if thresholds met
         current_draft = self.drafts[-1]
-        chars_since_update = len(self.accumulated_text) - len(current_draft.text)
+        chars_since_update = len(display_text) - len(current_draft.text)
         current_draft.char_count_since_update = chars_since_update
 
         logger.debug(
@@ -266,7 +329,7 @@ class StreamingMessageHandler:
         )
 
         if self.should_update(current_draft, chars_since_update):
-            await self.update_draft(current_draft, self.accumulated_text)
+            await self.update_draft(current_draft, display_text)
             return True
 
         return False
@@ -278,11 +341,12 @@ class StreamingMessageHandler:
 
         self._finalized = True
 
-        # Update last draft with final accumulated text
+        # Update last draft with final accumulated text (include tool calls prefix for first draft)
         if self.drafts and self.accumulated_text:
             current_draft = self.drafts[-1]
-            if current_draft.text != self.accumulated_text:
-                current_draft.text = self.accumulated_text
+            final_text = self._first_draft_prefix() + self.accumulated_text
+            if current_draft.text != final_text:
+                current_draft.text = final_text
 
         # Finalize all drafts
         for draft in self.drafts:
@@ -312,5 +376,6 @@ class StreamingMessageHandler:
 
         self.drafts.clear()
         self.accumulated_text = ""
+        self.tool_calls_text = ""
         logger.debug(f"Cancelled streaming for user {self.user_id}")
         return True

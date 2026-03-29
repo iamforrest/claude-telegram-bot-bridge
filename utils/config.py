@@ -150,6 +150,10 @@ class Config(BaseSettings):
     draft_update_interval: float = Field(
         default=1.0, description="Minimum seconds between draft updates"
     )
+    enable_streaming_tool_calls: bool = Field(
+        default=False,
+        description="Whether to show tool calls in Telegram streaming messages",
+    )
 
     # Voice message configuration
     transcription_provider: str = Field(

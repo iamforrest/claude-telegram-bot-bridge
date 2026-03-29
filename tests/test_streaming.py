@@ -14,6 +14,7 @@ config_module = types.ModuleType("telegram_bot.utils.config")
 config_module.config = SimpleNamespace(
     draft_update_min_chars=20,
     draft_update_interval=0.1,
+    enable_streaming_tool_calls=False,
 )
 sys.modules["telegram_bot.utils.config"] = config_module
 
@@ -61,6 +62,19 @@ class _BotEditNotModified:
         raise TelegramError(
             "Message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
         )
+
+
+class _BotRecorder:
+    def __init__(self):
+        self.calls = []
+
+    async def send_message(self, *, chat_id, text):
+        self.calls.append(("send_message", chat_id, text))
+        return SimpleNamespace(message_id=404)
+
+    async def edit_message_text(self, *, chat_id, message_id, text):
+        self.calls.append(("edit_message_text", chat_id, message_id, text))
+        return True
 
 
 class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -124,6 +138,29 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         ok = await handler.finalize_draft(draft)
 
         self.assertTrue(ok)
+
+    async def test_add_tool_call_is_disabled_by_default(self):
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+
+        ok = await handler.add_tool_call("Read", {"file_path": "/tmp/a.txt"})
+
+        self.assertFalse(ok)
+        self.assertEqual(handler.tool_calls_text, "")
+        self.assertEqual(bot.calls, [])
+
+    async def test_add_tool_call_updates_draft_when_enabled(self):
+        bot = _BotRecorder()
+        handler = StreamingMessageHandler(bot=bot, chat_id=42, user_id=7)
+        handler.enable_tool_calls = True
+
+        ok = await handler.add_tool_call("Read", {"file_path": "/tmp/a.txt"})
+
+        self.assertTrue(ok)
+        self.assertIn("**Read**", handler.tool_calls_text)
+        self.assertEqual(len(bot.calls), 1)
+        self.assertEqual(bot.calls[0][0], "send_message")
+        self.assertIn("/tmp/a.txt", bot.calls[0][2])
 
 
 if __name__ == "__main__":
