@@ -43,7 +43,7 @@ from telegram_bot.core.project_chat import (
     ChatResponse,
     CONVERSATIONS_DIR,
 )
-from claude_code_sdk.types import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from telegram_bot.utils.chat_logger import log_debug
 from telegram_bot.utils.audio_processor import AudioProcessor
 from telegram_bot.utils.transcription import (

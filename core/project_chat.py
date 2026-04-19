@@ -12,45 +12,23 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable, Deque
 from dataclasses import dataclass, field
 
-from claude_code_sdk import (
+from claude_agent_sdk import (
     ClaudeSDKClient,
-    ClaudeCodeOptions,
+    ClaudeAgentOptions,
     AssistantMessage,
     ResultMessage,
+    RateLimitEvent,
     TextBlock,
     ToolUseBlock,
     PermissionResultAllow,
     PermissionResultDeny,
 )
 
-from claude_code_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
-
 from telegram_bot.utils.chat_logger import log_chat
 from telegram_bot.utils.config import config
 from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
-
-
-def _patch_sdk_cli_resolution() -> None:
-    """Make SDK default transport honor configured CLAUDE_CLI_PATH."""
-    marker = "_telegram_bot_cli_path_patch_applied"
-    if getattr(SubprocessCLITransport, marker, False):
-        return
-    if not config.claude_cli_path:
-        return
-
-    cli_path = str(config.claude_cli_path)
-
-    def patched_find_cli(self):
-        return cli_path
-
-    setattr(SubprocessCLITransport, "_find_cli", patched_find_cli)
-    setattr(SubprocessCLITransport, marker, True)
-    logger.info(f"Patched SDK CLI resolution to use configured path: {cli_path}")
-
-
-_patch_sdk_cli_resolution()
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"]).resolve()
 PROJECT_DIR_NAME = str(PROJECT_ROOT).replace("/", "-").replace("_", "-")
@@ -287,29 +265,35 @@ class ProjectChatHandler:
             "cwd": str(self.project_root),
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": ["AskUserQuestion"],  # Disable to force degradation
-            "append_system_prompt": (
-                "\n\n## Important: User Questions and Choices\n\n"
-                "The AskUserQuestion tool is NOT available in this environment. "
-                "When you need to ask the user a question with multiple choice options:\n\n"
-                "1. Output the question and context clearly\n"
-                "2. List options with numbers (1., 2., 3., etc.)\n"
-                "3. STOP and WAIT for the user's response\n"
-                "4. Do NOT continue execution or make assumptions\n"
-                "5. Do NOT try to use AskUserQuestion tool\n\n"
-                "Example format:\n"
-                "Question: Which option do you prefer?\n\n"
-                "1. Option A - Description\n"
-                "2. Option B - Description\n"
-                "3. Option C - Description\n\n"
-                "After outputting options, you MUST stop and wait for user input."
-            ),
+            "system_prompt": {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": (
+                    "\n\n## Important: User Questions and Choices\n\n"
+                    "The AskUserQuestion tool is NOT available in this environment. "
+                    "When you need to ask the user a question with multiple choice options:\n\n"
+                    "1. Output the question and context clearly\n"
+                    "2. List options with numbers (1., 2., 3., etc.)\n"
+                    "3. STOP and WAIT for the user's response\n"
+                    "4. Do NOT continue execution or make assumptions\n"
+                    "5. Do NOT try to use AskUserQuestion tool\n\n"
+                    "Example format:\n"
+                    "Question: Which option do you prefer?\n\n"
+                    "1. Option A - Description\n"
+                    "2. Option B - Description\n"
+                    "3. Option C - Description\n\n"
+                    "After outputting options, you MUST stop and wait for user input."
+                ),
+            },
             "can_use_tool": can_use_tool,
             "permission_mode": "default",
         }
         if model:
             opts["model"] = model
+        if config.claude_cli_path:
+            opts["cli_path"] = str(config.claude_cli_path)
 
-        client = ClaudeSDKClient(options=ClaudeCodeOptions(**opts))
+        client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
         await client.connect()
         state = _UserStreamState(client=client, model=model)
         state_holder["state"] = state
@@ -446,6 +430,33 @@ class ProjectChatHandler:
                         await req.typing_callback()
                     except Exception:
                         pass
+
+                if isinstance(msg, RateLimitEvent):
+                    info = msg.rate_limit_info
+                    if info.resets_at:
+                        import time as _time
+                        wait_s = max(0, int(info.resets_at - _time.time()))
+                        resets_human = _time.strftime(
+                            "%H:%M", _time.localtime(info.resets_at)
+                        )
+                        note = (
+                            f"⏳ Claude 速率限制 {info.status} "
+                            f"({info.rate_limit_type or 'n/a'}), "
+                            f"{wait_s // 60}m{wait_s % 60}s 后恢复 ({resets_human})"
+                        )
+                    else:
+                        note = f"⏳ Claude 速率限制 {info.status}"
+                    logger.warning(
+                        f"RateLimitEvent for user {user_id}: status={info.status}, "
+                        f"type={info.rate_limit_type}, resets_at={info.resets_at}, "
+                        f"utilization={info.utilization}"
+                    )
+                    if req.streaming_handler:
+                        try:
+                            await req.streaming_handler.update_if_needed(note)
+                        except Exception as e:
+                            logger.error(f"Rate-limit notice failed: {e}")
+                    continue
 
                 if isinstance(msg, AssistantMessage):
                     logger.debug(
