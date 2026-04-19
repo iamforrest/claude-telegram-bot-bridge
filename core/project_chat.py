@@ -53,46 +53,66 @@ ALLOWED_TOOLS = [
 PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600"))
 
 
-def _is_retryable_sdk_error(error: Exception) -> bool:
-    """Check if the SDK error is transient and worth retrying.
+# A-class label map for subscription-quota rate limit windows
+_RATE_LIMIT_TYPE_LABELS = {
+    "five_hour": "5 小时滚动窗口",
+    "seven_day": "7 天窗口",
+    "seven_day_opus": "7 天 Opus 窗口",
+    "seven_day_sonnet": "7 天 Sonnet 窗口",
+    "overage": "超额配额",
+}
 
-    Returns True for network/timeout errors, False for permanent errors like
-    configuration issues, permission errors, or code bugs.
+# Error categories surfaced as SDK exceptions (A-class is event-driven, not here)
+ERR_CATEGORY_TRANSIENT = "B"   # provider transient overload/429/529 -> retry
+ERR_CATEGORY_NETWORK = "C"     # network/subprocess/timeout -> retry
+ERR_CATEGORY_PERMANENT = "P"   # config/code/permission -> do not retry
+
+
+def _classify_sdk_error(error: Exception) -> str:
+    """Classify an SDK exception into B/C/P category.
+
+    A-class (subscription quota exhausted) is surfaced via RateLimitEvent, not
+    exceptions, so it does not appear here.
     """
     error_type = type(error).__name__
-    error_msg = str(error)
+    error_msg_lower = str(error).lower()
 
-    # Permanent errors that should NOT be retried
-    NON_RETRYABLE_PATTERNS = [
-        "Invalid token",
-        "Permission denied",
-        "No such file",
-        "Configuration error",
-        "AttributeError",
-        "KeyError",
-        "ValueError",
-        "TypeError",
+    # P: permanent config / code / permission errors — never retry
+    PERMANENT_MSG_PATTERNS = [
+        "invalid token",
+        "permission denied",
+        "no such file",
+        "configuration error",
     ]
+    PERMANENT_TYPES = {"AttributeError", "KeyError", "ValueError", "TypeError"}
+    if error_type in PERMANENT_TYPES or any(
+        p in error_msg_lower for p in PERMANENT_MSG_PATTERNS
+    ):
+        return ERR_CATEGORY_PERMANENT
 
-    # Check if it's a permanent error
-    if any(pattern in error_msg for pattern in NON_RETRYABLE_PATTERNS):
-        return False
+    # B: provider transient overload / server-side rate limit (quota fine)
+    TRANSIENT_MSG_PATTERNS = [
+        "overloaded",
+        "529",
+        "rate limit",
+        "too many requests",
+        "429",
+        "service unavailable",
+        "503",
+    ]
+    if any(p in error_msg_lower for p in TRANSIENT_MSG_PATTERNS):
+        return ERR_CATEGORY_TRANSIENT
 
-    # Retry all timeout and connection errors by default
-    RETRYABLE_TYPES = [
+    # C: network / subprocess / timeout
+    NETWORK_TYPES = {
         "TimeoutError",
         "ConnectionError",
         "ConnectionRefusedError",
         "ConnectionResetError",
         "BrokenPipeError",
         "OSError",
-    ]
-
-    if error_type in RETRYABLE_TYPES:
-        return True
-
-    # Also retry if error message contains common transient error patterns
-    RETRYABLE_MSG_PATTERNS = [
+    }
+    NETWORK_MSG_PATTERNS = [
         "timeout",
         "connection",
         "refused",
@@ -100,8 +120,46 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
         "exit code -15",  # SIGTERM
         "exit code -9",  # SIGKILL
     ]
+    if error_type in NETWORK_TYPES or any(
+        p in error_msg_lower for p in NETWORK_MSG_PATTERNS
+    ):
+        return ERR_CATEGORY_NETWORK
 
-    return any(pattern in error_msg.lower() for pattern in RETRYABLE_MSG_PATTERNS)
+    return ERR_CATEGORY_PERMANENT
+
+
+def _is_retryable_sdk_error(error: Exception) -> bool:
+    """Back-compat wrapper used by external callers. True iff B or C."""
+    return _classify_sdk_error(error) in (
+        ERR_CATEGORY_TRANSIENT,
+        ERR_CATEGORY_NETWORK,
+    )
+
+
+def _err_snippet(msg: str, limit: int = 200) -> str:
+    """Trim long error messages for user-facing display."""
+    return msg[:limit] + ("…" if len(msg) > limit else "")
+
+
+async def _send_standalone_notice(req: "_PendingRequest", text: str) -> None:
+    """Send a persistent Telegram message that won't be overwritten by streaming drafts."""
+    handler = req.streaming_handler
+    if not handler:
+        return
+    try:
+        await handler.bot.send_message(chat_id=req.chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Failed to send standalone notice to {req.chat_id}: {e}")
+
+
+async def _send_chat_notice(bot_obj, chat_id: int, text: str) -> None:
+    """Like `_send_standalone_notice` but without requiring a live streaming handler."""
+    if not bot_obj:
+        return
+    try:
+        await bot_obj.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Failed to send chat notice to {chat_id}: {e}")
 
 
 def _format_ask_user_question(tool_input: dict):
@@ -191,6 +249,9 @@ class _UserStreamState:
     reader_task: Optional[asyncio.Task] = None
     typing_task: Optional[asyncio.Task] = None
     last_session_id: Optional[str] = None
+    # A-class rejection event still in effect (resets_at in the future).
+    # Consulted before retrying to avoid pointless retries during a quota block.
+    last_rate_limit: Optional["RateLimitEvent"] = None
 
 
 class ProjectChatHandler:
@@ -433,29 +494,52 @@ class ProjectChatHandler:
 
                 if isinstance(msg, RateLimitEvent):
                     info = msg.rate_limit_info
-                    if info.resets_at:
-                        import time as _time
-                        wait_s = max(0, int(info.resets_at - _time.time()))
-                        resets_human = _time.strftime(
-                            "%H:%M", _time.localtime(info.resets_at)
-                        )
-                        note = (
-                            f"⏳ Claude 速率限制 {info.status} "
-                            f"({info.rate_limit_type or 'n/a'}), "
-                            f"{wait_s // 60}m{wait_s % 60}s 后恢复 ({resets_human})"
-                        )
-                    else:
-                        note = f"⏳ Claude 速率限制 {info.status}"
+                    import time as _time
+
                     logger.warning(
                         f"RateLimitEvent for user {user_id}: status={info.status}, "
                         f"type={info.rate_limit_type}, resets_at={info.resets_at}, "
                         f"utilization={info.utilization}"
                     )
-                    if req.streaming_handler:
-                        try:
-                            await req.streaming_handler.update_if_needed(note)
-                        except Exception as e:
-                            logger.error(f"Rate-limit notice failed: {e}")
+
+                    type_label = _RATE_LIMIT_TYPE_LABELS.get(
+                        info.rate_limit_type or "",
+                        info.rate_limit_type or "unknown",
+                    )
+
+                    # A-class: subscription quota exhausted. Persist the event so
+                    # the retry path can refuse to retry while the window is open.
+                    if info.status == "rejected":
+                        state.last_rate_limit = msg
+                        if info.resets_at:
+                            wait_s = max(0, int(info.resets_at - _time.time()))
+                            resets_human = _time.strftime(
+                                "%H:%M", _time.localtime(info.resets_at)
+                            )
+                            notice = (
+                                f"📊 Claude 套餐配额已达上限\n"
+                                f"• 窗口：{type_label}\n"
+                                f"• 恢复时间：{resets_human}"
+                                f"（约 {wait_s // 60}m{wait_s % 60}s 后）\n"
+                                f"此错误不会自动重试，请等待或切换模型。"
+                            )
+                        else:
+                            notice = (
+                                f"📊 Claude 套餐配额已达上限\n"
+                                f"• 窗口：{type_label}\n"
+                                f"此错误不会自动重试，请等待或切换模型。"
+                            )
+                        await _send_standalone_notice(req, notice)
+                    else:
+                        # allowed / allowed_warning: recovered — clear any block.
+                        state.last_rate_limit = None
+                        if info.status == "allowed_warning":
+                            pct = int((info.utilization or 0) * 100)
+                            notice = (
+                                f"⚠️ Claude 配额使用 {pct}% "
+                                f"({type_label}) — 接近限流阈值"
+                            )
+                            await _send_standalone_notice(req, notice)
                     continue
 
                 if isinstance(msg, AssistantMessage):
@@ -494,6 +578,9 @@ class ProjectChatHandler:
 
                 if isinstance(msg, ResultMessage):
                     state.last_session_id = msg.session_id or state.last_session_id
+                    if not msg.is_error:
+                        # Successful round-trip clears any prior A-class block.
+                        state.last_rate_limit = None
                     result_text = msg.result or "\n".join(req.last_assistant_texts)
 
                     # Finalize streaming drafts
@@ -704,29 +791,63 @@ class ProjectChatHandler:
                     pass
 
             err = str(e)
+            err_type = type(e).__name__
+            category = _classify_sdk_error(e)
             logger.error(
-                f"SDK error for user {user_id}: {err} (type: {type(e).__name__})",
+                f"SDK error for user {user_id}: {err} "
+                f"(type: {err_type}, category: {category})",
                 exc_info=True,
             )
 
-            # Retry once for transient SDK errors (network/timeout errors)
-            is_retryable = _is_retryable_sdk_error(e)
-            logger.info(
-                f"Error retryability check for user {user_id}: "
-                f"is_retryable={is_retryable}, error='{err[:100]}...'"
-            )
+            # A-class check: if an un-expired quota rejection is in effect,
+            # refuse to retry regardless of this exception's category.
+            active_a_info = None
+            if state and state.last_rate_limit:
+                import time as _time
+                _info = state.last_rate_limit.rate_limit_info
+                if _info.resets_at and _info.resets_at > _time.time():
+                    active_a_info = _info
 
-            if is_retryable:
+            if active_a_info:
+                import time as _time
+                type_label = _RATE_LIMIT_TYPE_LABELS.get(
+                    active_a_info.rate_limit_type or "",
+                    active_a_info.rate_limit_type or "unknown",
+                )
+                remaining = max(
+                    0, int(active_a_info.resets_at - _time.time())
+                )
+                notice = (
+                    f"⏸️ 套餐限流窗口未恢复（{type_label}，约 "
+                    f"{remaining // 60}m{remaining % 60}s 后），跳过重试\n"
+                    f"原错误：{_err_snippet(err)}"
+                )
+                health_reporter.record_claude_error(err)
+                return ChatResponse(content=notice, success=False, error=err)
+
+            if category in (ERR_CATEGORY_TRANSIENT, ERR_CATEGORY_NETWORK):
+                # Tell the user mid-flight — this message won't be overwritten
+                # by streaming drafts because it's a standalone send.
+                if category == ERR_CATEGORY_TRANSIENT:
+                    retry_notice = (
+                        f"⚠️ 服务端临时限流（{err_type}），正在自动重试（1/1）…\n"
+                        f"原错误：{_err_snippet(err)}"
+                    )
+                else:
+                    retry_notice = (
+                        f"⚠️ 连接中断（{err_type}），正在重建连接重试（1/1）…\n"
+                        f"原错误：{_err_snippet(err)}"
+                    )
+                await _send_chat_notice(bot, chat_id, retry_notice)
+
                 logger.warning(
-                    "Retryable SDK error for user %s: %s — reconnecting and retrying",
+                    "Retryable SDK error (category=%s) for user %s: %s — "
+                    "reconnecting and retrying",
+                    category,
                     user_id,
                     err,
                 )
-                logger.info(f"Disconnecting stream for user {user_id} before retry...")
                 await self._disconnect_user_stream(user_id)
-                logger.info(
-                    f"Stream disconnected for user {user_id}, creating retry request..."
-                )
 
                 retry_future: asyncio.Future = loop.create_future()
                 retry_handler = None
@@ -769,16 +890,24 @@ class ProjectChatHandler:
                         exc_info=True,
                     )
                     retry_msg = str(retry_err)
+                    fail_notice = (
+                        f"❌ 重试后仍失败\n"
+                        f"分类：{category}\n"
+                        f"原因：{_err_snippet(retry_msg)}"
+                    )
                     health_reporter.record_claude_error(retry_msg)
                     return ChatResponse(
-                        content=f"❌ Error: {retry_msg}",
-                        success=False,
-                        error=retry_msg,
+                        content=fail_notice, success=False, error=retry_msg
                     )
 
+            # Permanent (P) — surface a friendlier error so the user sees why.
+            perm_notice = (
+                f"❌ {err_type}：{_err_snippet(err)}\n"
+                f"说明：此错误属于永久性错误（配置/权限/代码层），不会自动重试。"
+            )
             logger.error(f"Error processing message: {e}", exc_info=True)
             health_reporter.record_claude_error(err)
-            return ChatResponse(content=f"❌ Error: {err}", success=False, error=err)
+            return ChatResponse(content=perm_notice, success=False, error=err)
 
         finally:
             self._active_tasks.pop(user_id, None)
