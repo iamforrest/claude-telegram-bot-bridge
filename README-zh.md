@@ -358,6 +358,15 @@ ffmpeg -version
 
 启用完整控制台日志、逐会话聊天记录和 SDK 工具调用追踪。
 
+## Fork 文档
+
+本仓库是 [terranc/claude-telegram-bot-bridge](https://github.com/terranc/claude-telegram-bot-bridge) 的 fork，由 [@iamforrest](https://github.com/iamforrest) 维护。额外文档在 [`docs/`](docs/) 下：
+
+- [`docs/FORK_NOTES.md`](docs/FORK_NOTES.md) —— 本 fork 相对上游的差异（迁移到 claude-agent-sdk、限流三分类、可观测性等）
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) —— 日常运维（启停、日志、多 bot、launchd、卸载）
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) —— 跨机器开发工作流（改完 → commit → push → 其它机器 `--upgrade`）
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) —— 已知坑 + 诊断命令
+
 ## 许可证
 
 MIT

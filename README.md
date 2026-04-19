@@ -360,6 +360,15 @@ After this, `--install` will work correctly in protected directories.
 
 Enables full console logging, per-session chat logs, and SDK tool call tracing.
 
+## Fork documentation
+
+This repository is a fork of [terranc/claude-telegram-bot-bridge](https://github.com/terranc/claude-telegram-bot-bridge) maintained by [@iamforrest](https://github.com/iamforrest), with additional docs under [`docs/`](docs/) (Chinese):
+
+- [`docs/FORK_NOTES.md`](docs/FORK_NOTES.md) — Differences from upstream (claude-agent-sdk migration, rate-limit classification, observability)
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — Daily operations (start/stop/logs/multi-bot/launchd/uninstall)
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — Cross-machine development workflow (edit → commit → push → `--upgrade` on other machines)
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — Known gotchas and diagnostic commands
+
 ## License
 
 MIT

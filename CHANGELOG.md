@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - fork additions
+
+### Added (iamforrest fork)
+- `docs/FORK_NOTES.md`, `docs/OPERATIONS.md`, `docs/DEVELOPMENT.md`, `docs/TROUBLESHOOTING.md` covering fork-specific deployment, operations, cross-machine development workflow, and troubleshooting
+- Categorize SDK errors into A (subscription quota exhausted) / B (server transient overload) / C (network/subprocess) / P (permanent), with Telegram notices at each retry transition so the user can see why each pause happened
+- Track the latest `RateLimitEvent` per user and skip retry while the rejection window is still active
+
+### Changed (iamforrest fork)
+- Migrated from `claude-code-sdk` to `claude-agent-sdk` (>= 0.1.63); drops local monkey-patch for `rate_limit_event` parsing and for `SubprocessCLITransport._find_cli`
+- Replaced `append_system_prompt` usage with the new `system_prompt={"type":"preset","preset":"claude_code","append":...}` form
+- `_is_retryable_sdk_error` kept as back-compat wrapper delegating to the new `_classify_sdk_error`
+
 ## [0.9.5] - 2026-04-10
 
 ### Added
