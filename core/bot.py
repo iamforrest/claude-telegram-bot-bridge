@@ -752,6 +752,13 @@ class TelegramBot:
             MessageHandler(filters.VOICE, self._handle_voice_message), group=2
         )
         self.application.add_handler(
+            MessageHandler(
+                filters.PHOTO | filters.Document.ALL,
+                self._handle_attachment_message,
+            ),
+            group=2,
+        )
+        self.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message),
             group=2,
         )
@@ -2069,6 +2076,111 @@ class TelegramBot:
                 f"Error: {str(e)}\n\n"
                 "Please try again later."
             )
+
+    _MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
+    _FILENAME_SANITIZE_RE = re.compile(r"[^\w.\-]+")
+
+    def _build_attachment_path(
+        self, user_id: int, original_name: str
+    ) -> FilePath:
+        uploads_dir = config.bot_data_dir / "uploads" / str(user_id)
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = self._FILENAME_SANITIZE_RE.sub("_", original_name).strip("_")
+        if not safe_name:
+            safe_name = "file"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return uploads_dir / f"{ts}_{safe_name}"
+
+    async def _handle_attachment_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Download photos/documents into PROJECT_ROOT and forward the path to Claude."""
+        del context
+        if not await self._check_access(update):
+            return
+        message = self._require_message(update)
+        user_id = self._require_user(update).id
+
+        file_obj: Any = None
+        kind: str = ""
+        original_name: str = ""
+        file_size: Optional[int] = None
+
+        if message.photo:
+            photo = message.photo[-1]
+            file_obj = photo
+            kind = "image"
+            original_name = f"photo_{photo.file_unique_id}.jpg"
+            file_size = getattr(photo, "file_size", None)
+        elif message.document:
+            doc = message.document
+            file_obj = doc
+            mime = (getattr(doc, "mime_type", "") or "").lower()
+            kind = "image" if mime.startswith("image/") else "document"
+            original_name = doc.file_name or f"document_{doc.file_unique_id}"
+            file_size = getattr(doc, "file_size", None)
+        else:
+            return
+
+        if file_size and file_size > self._MAX_ATTACHMENT_BYTES:
+            await message.reply_text(
+                f"❌ File is too large ({file_size // (1024 * 1024)} MB). "
+                f"Max {self._MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB."
+            )
+            return
+
+        caption = (message.caption or "").strip()
+        dest_path = self._build_attachment_path(user_id, original_name)
+        log_debug(
+            user_id,
+            kind,
+            f"{kind}:{file_obj.file_id} size={file_size} -> {dest_path}",
+        )
+
+        try:
+            app = self._require_application()
+            telegram_file = await app.bot.get_file(file_obj.file_id)
+            if hasattr(telegram_file, "download_to_drive"):
+                await telegram_file.download_to_drive(custom_path=str(dest_path))
+            elif hasattr(app.bot, "download_file"):
+                await app.bot.download_file(
+                    telegram_file.file_path, custom_path=str(dest_path)
+                )
+            else:
+                raise RuntimeError("Telegram file download API is unavailable.")
+        except Exception as exc:
+            logger.error(
+                "Attachment download failed for user %s: %s",
+                user_id,
+                exc,
+                exc_info=True,
+            )
+            await message.reply_text(
+                f"❌ Failed to download your {kind}. Please retry."
+            )
+            return
+
+        if kind == "image":
+            header = f"[User sent an image saved at: {dest_path}]"
+            default_instruction = "Please read and analyze this image."
+        else:
+            header = f"[User sent a file saved at: {dest_path}]"
+            default_instruction = "Please read and analyze this file."
+
+        body = caption if caption else default_instruction
+        text = f"{header}\n\n{body}"
+
+        async def run_task():
+            await self._process_user_message_text(
+                update, user_id, text, message_source="text"
+            )
+
+        async def on_overflow():
+            reply = "⏳ Processing previous messages, please wait or send /stop to terminate."
+            await message.reply_text(reply)
+            log_debug(user_id, "bot", reply)
+
+        await self._enqueue_user_task(user_id, run_task, on_overflow)
 
     async def _handle_voice_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
