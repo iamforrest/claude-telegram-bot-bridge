@@ -274,13 +274,18 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 health_path = Path(sys.argv[1])
 pid = sys.argv[2]
 stale_seconds = int(sys.argv[3])
 
 
-def parse_iso(value: str | None):
+def parse_iso(value):
+    # type: (Optional[str]) -> Optional[datetime]
+    # Plain hint (no `str | None`) so this inline script also runs on the
+    # stock macOS /usr/bin/python3 (3.9), which start.sh invokes before
+    # the venv python is available.
     if not value:
         return None
     try:

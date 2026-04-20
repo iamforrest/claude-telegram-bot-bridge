@@ -7,6 +7,7 @@ import re
 import asyncio
 import json
 import logging
+import signal
 from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable, Deque
@@ -364,12 +365,62 @@ class ProjectChatHandler:
         )
         return state
 
+    @staticmethod
+    def _grab_transport_pid(client: ClaudeSDKClient) -> Optional[int]:
+        """Snapshot the subprocess PID from the SDK transport, if accessible.
+
+        Private-API access: claude-agent-sdk does not expose the child PID
+        publicly, but we need it as a last-resort kill target in case
+        client.disconnect() hangs on an anyio cancel scope mismatch.
+        """
+        try:
+            transport = getattr(client, "_transport", None)
+            process = getattr(transport, "_process", None) if transport else None
+            pid = getattr(process, "pid", None) if process else None
+            return int(pid) if pid else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _force_kill_pid(pid: int, user_id: int) -> None:
+        """SIGTERM then SIGKILL a leaked claude subprocess by PID.
+
+        SDK's own close() is supposed to do this, but when it is invoked from
+        a different task than the one that set up the anyio scope, cleanup
+        short-circuits on an anyio error and the child is orphaned.
+        """
+        for sig, label, wait_s in ((signal.SIGTERM, "SIGTERM", 2.0), (signal.SIGKILL, "SIGKILL", 0.0)):
+            try:
+                os.kill(pid, sig)
+                logger.warning(
+                    f"Sent {label} to leaked claude subprocess pid={pid} (user={user_id})"
+                )
+            except ProcessLookupError:
+                return  # already gone
+            except Exception as e:
+                logger.error(f"Failed to {label} pid={pid}: {e}")
+                return
+            if wait_s > 0:
+                # Brief wait to let SIGTERM take effect before escalating.
+                import time as _t
+                deadline = _t.monotonic() + wait_s
+                while _t.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)  # probe
+                    except ProcessLookupError:
+                        return
+                    _t.sleep(0.1)
+
     async def _disconnect_user_stream(
         self, user_id: int, cancel_message: Optional[str] = None
     ) -> bool:
         state = self._streams.pop(user_id, None)
         if not state:
             return False
+
+        # Snapshot subprocess PID before anything can clear it, so we can
+        # force-kill the child even if disconnect() fails mid-flight.
+        pid = self._grab_transport_pid(state.client)
 
         # Cancel typing keepalive task
         if state.typing_task and not state.typing_task.done():
@@ -412,13 +463,28 @@ class ProjectChatHandler:
                 except Exception as e:
                     logger.error(f"Error setting future result: {e}")
 
-        # Disconnect client
+        # Disconnect client. Timeout covers the SDK's own graceful-shutdown
+        # ladder (stdin EOF + 5s wait → SIGTERM + 5s wait → SIGKILL), so
+        # 12s leaves headroom. 3s used to cut it off before SIGKILL ran.
         try:
-            await asyncio.wait_for(state.client.disconnect(), timeout=3.0)
+            await asyncio.wait_for(state.client.disconnect(), timeout=12.0)
         except asyncio.TimeoutError:
             logger.warning(f"Client disconnect for user {user_id} timed out")
         except Exception as e:
             logger.error(f"Error disconnecting client for user {user_id}: {e}")
+
+        # Last-resort: if the subprocess is still alive (e.g. anyio cancel
+        # scope error aborted SDK cleanup), force-kill it directly. Otherwise
+        # it leaks and accumulates — we saw a 10h+ orphan 2026-04-19.
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            else:
+                self._force_kill_pid(pid, user_id)
 
         return True
 

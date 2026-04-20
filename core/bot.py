@@ -860,6 +860,17 @@ class TelegramBot:
         # Cancel any ongoing streaming
         await self._cancel_user_streaming(user_id)
 
+        # If a task is currently executing, cancel it and tear the SDK stream
+        # down before starting a new session — otherwise /new leaves the stuck
+        # task and its claude subprocess running, and the user's next message
+        # re-enters the same hung state.
+        active_task = self._active_tasks.get(user_id)
+        if active_task and not active_task.done():
+            active_task.cancel()
+            logger.info("Cancelled active task for user %s via /new", user_id)
+        await project_chat_handler.stop(user_id)
+        self._clear_user_queue(user_id)
+
         session = await session_manager.get_session(user_id)
         session["session_id"] = None
         session["new_session"] = True
