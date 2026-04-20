@@ -376,6 +376,17 @@ class TelegramBot:
         while not stop_event.is_set():
             await asyncio.sleep(self._WATCHDOG_INTERVAL)
 
+            # Heartbeat every tick, even before any network call. If
+            # get_me() hangs past its own wait_for timeout (httpx pool
+            # deadlock etc.), record_telegram_error() may never fire and
+            # updated_at freezes — which is exactly what fools the
+            # external supervisor into thinking the bot is alive. Bumping
+            # updated_at here proves the event loop is still scheduling.
+            try:
+                health_reporter.record_heartbeat()
+            except Exception:
+                pass
+
             updater = self.application.updater if self.application else None
             if not self.application or not updater or not updater.running:
                 continue
@@ -406,6 +417,16 @@ class TelegramBot:
                         await asyncio.wait_for(updater.stop(), timeout=15)
                     except asyncio.TimeoutError:
                         logger.error("updater.stop() timed out, forcing process exit")
+                        os._exit(1)
+                    except Exception as stop_err:
+                        # Any other teardown error (anyio cancel scope,
+                        # pool exhaustion, etc.) used to leave the bot
+                        # silently wedged — log and hard-exit so the
+                        # supervisor can bring up a fresh process.
+                        logger.error(
+                            "updater.stop() failed (%s), forcing process exit",
+                            stop_err,
+                        )
                         os._exit(1)
                     raise _PollingRestart()
 

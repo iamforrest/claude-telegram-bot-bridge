@@ -135,6 +135,18 @@ class RuntimeHealthReporter:
                 self._state["service"]["reason"] = _normalize_reason(reason)
             self._write_health_locked()
 
+    def record_heartbeat(self) -> None:
+        """Touch updated_at without changing any health state.
+
+        Used by the polling watchdog on every tick so external liveness
+        checkers (start.sh supervisor) can tell the event loop is alive
+        even when every Telegram/Claude probe is failing — otherwise a
+        fully-wedged event loop looks identical to a healthy but degraded
+        one from the outside.
+        """
+        with self._lock:
+            self._write_health_locked()
+
     def record_telegram_ok(self) -> None:
         with self._lock:
             self._state["telegram"]["state"] = "healthy"

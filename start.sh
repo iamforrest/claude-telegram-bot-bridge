@@ -923,10 +923,79 @@ exec_bot_once() {
     exec "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT"
 }
 
+health_file_stale_seconds() {
+    # Print the age (in seconds) of health.json's updated_at, or -1 if
+    # the file is missing/unparseable. Uses the stock /usr/bin/python3
+    # so it works before the venv exists.
+    local health_path="$1"
+    python3 - "$health_path" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(-1)
+    sys.exit(0)
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    raw = data.get("updated_at", "")
+    if not raw:
+        print(-1)
+        sys.exit(0)
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    age = int((datetime.now(timezone.utc) - dt).total_seconds())
+    print(max(age, 0))
+except Exception:
+    print(-1)
+PY
+}
+
+supervise_child_with_liveness() {
+    # Poll the child PID while watching health.json for staleness. The
+    # in-process watchdog hardening is belt; this is suspenders — covers
+    # the case where the python event loop itself is frozen and cannot
+    # run any of its own recovery logic.
+    local pid="$1"
+    local interval="$2"
+    local stale_max="$3"
+
+    (
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep "$interval"
+            kill -0 "$pid" 2>/dev/null || break
+            local age
+            age=$(health_file_stale_seconds "$HEALTH_FILE" 2>/dev/null || echo "-1")
+            if [ -z "$age" ]; then
+                age=-1
+            fi
+            if [ "$age" -ge 0 ] && [ "$age" -gt "$stale_max" ]; then
+                echo "⚠️  Liveness check: health.json not updated for ${age}s (> ${stale_max}s), killing wedged bot (PID $pid)" | tee -a "$LOGS_DIR/supervisor.log"
+                kill -KILL "$pid" 2>/dev/null || true
+                break
+            fi
+        done
+    ) &
+    # The liveness watcher exits on its own when the child dies; no need
+    # to track it — leftover zombie is reaped by the shell when we exit.
+}
+
 run_daemon_supervisor() {
     MAX_RAPID_CRASHES=5
     RAPID_CRASH_WINDOW=60
     RESTART_DELAY_BASE=3
+    # External liveness: poll health.json's updated_at. The in-process
+    # polling watchdog runs every 60s and is expected to either recover
+    # within _NETWORK_FAILURE_THRESHOLD (300s) or exit. If updated_at
+    # stays frozen past LIVENESS_STALE_MAX, the event loop itself is
+    # wedged — SIGKILL the child and let the crash-restart loop below
+    # bring up a fresh process. 600s covers the internal 300s recovery
+    # window plus headroom.
+    LIVENESS_POLL_INTERVAL=60
+    LIVENESS_STALE_MAX=600
     rapid_crash_count=0
     child_pid=""
 
@@ -967,6 +1036,7 @@ run_daemon_supervisor() {
                 "$VENV_DIR/bin/python" -m telegram_bot --path "$PROJECT_ROOT" &
         fi
         child_pid=$!
+        supervise_child_with_liveness "$child_pid" "$LIVENESS_POLL_INTERVAL" "$LIVENESS_STALE_MAX"
         wait "$child_pid"
         exit_code=$?
         child_pid=""
