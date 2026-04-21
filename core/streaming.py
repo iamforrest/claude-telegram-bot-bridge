@@ -33,7 +33,21 @@ class StreamingMessageHandler:
 
     Manages draft message lifecycle: creation, updates, finalization, and cancellation.
     Supports multi-message handling for content exceeding 4000 characters.
+
+    Telegram API calls are serialized through a background worker task so the
+    SDK reader loop (which drives update_if_needed / add_tool_call) never has to
+    await Telegram flood-control backoff. The worker caps per-call backoff at
+    MAX_BACKOFF_SECONDS; operations that would block longer are dropped.
     """
+
+    # Cap on retry_after we'll honor inside the worker. A long Telegram 429
+    # previously blocked the reader loop for minutes, which starved the SDK
+    # stream of readers and eventually tripped the 3600s process timeout.
+    MAX_BACKOFF_SECONDS = 3.0
+
+    # Bound the caller-facing finalize latency. The worker still drains in the
+    # background if it exceeds this, but process_message won't wait forever.
+    FINALIZE_DRAIN_TIMEOUT = 30.0
 
     def __init__(self, bot: Bot, chat_id: int, user_id: int):
         self.bot = bot
@@ -47,6 +61,42 @@ class StreamingMessageHandler:
         self.enable_tool_calls = getattr(config, "enable_streaming_tool_calls", False)
         self._finalized = False
         self._draft_seq = 0
+
+        # Worker pipeline. Ops are zero-arg coroutine factories; a None enqueues
+        # a shutdown sentinel that lets the worker exit cleanly after draining.
+        self._queue: "asyncio.Queue[Optional[Any]]" = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def _ensure_worker(self) -> None:
+        """Lazily start the worker on first enqueue."""
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
+
+    async def _worker_loop(self) -> None:
+        """Drain the op queue sequentially.
+
+        Each op is a zero-arg coroutine factory. Per-op exceptions are logged
+        and swallowed so one failing op (e.g. capped-out RetryAfter) can't
+        abort subsequent ones.
+        """
+        while True:
+            try:
+                op = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                if op is None:  # shutdown sentinel
+                    break
+                await op()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    f"Streaming worker op failed for user {self.user_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+            finally:
+                self._queue.task_done()
 
     def _next_draft_id(self) -> str:
         self._draft_seq += 1
@@ -84,41 +134,180 @@ class StreamingMessageHandler:
 
         return f"🛠️ **{name}**: `{summary}`\n"
 
+    # --- Public API (sync state mutation, async I/O) --------------------
+
+    async def update_if_needed(self, new_text_chunk: str) -> bool:
+        """Accumulate a text chunk and enqueue a render. State mutation is
+        synchronous so callers see the new state immediately; the Telegram
+        edit_message_text call is off-loaded to the worker to keep the SDK
+        reader loop from blocking on flood-control backoff.
+        """
+        if self._finalized:
+            return False
+        self.accumulated_text += new_text_chunk
+        self._ensure_worker()
+        self._queue.put_nowait(self._do_render_text)
+        return True
+
     async def add_tool_call(self, name: str, input: dict) -> bool:
-        """Add a tool call notification to the streaming output"""
+        """Append a tool-call line and enqueue a render with the tool prefix."""
         if self._finalized or not self.enable_tool_calls:
             return False
+        self.tool_calls_text += self._format_tool_call(name, input)
+        self._ensure_worker()
+        self._queue.put_nowait(self._do_render_tool_call)
+        return True
 
-        tool_line = self._format_tool_call(name, input)
-        self.tool_calls_text += tool_line
+    async def finalize_all(self) -> bool:
+        """Wait for the worker to drain, then commit final text to all drafts.
 
-        # Rebuild full text: tool calls prefix + accumulated content
+        Bounded by FINALIZE_DRAIN_TIMEOUT so a stalled Telegram flood can't
+        hold up the caller indefinitely. If we time out, the worker keeps
+        draining in the background until its shutdown sentinel is consumed.
+        """
+        if self._finalized:
+            return False
+
+        self._finalized = True
+        self._ensure_worker()
+
+        done_event = asyncio.Event()
+        self._queue.put_nowait(lambda ev=done_event: self._do_finalize(ev))
+        # Shutdown sentinel — processed after _do_finalize. Ensures the worker
+        # exits even if the caller stops awaiting us early.
+        self._queue.put_nowait(None)
+
+        try:
+            await asyncio.wait_for(
+                done_event.wait(), timeout=self.FINALIZE_DRAIN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Streaming finalize for user {self.user_id} did not drain within "
+                f"{self.FINALIZE_DRAIN_TIMEOUT}s — worker continuing in background"
+            )
+        return True
+
+    async def cancel(self) -> bool:
+        """Stop the worker immediately, drop queued ops, delete all drafts."""
+        if self._finalized:
+            return False
+
+        self._finalized = True
+
+        # Hard-cancel the worker so queued ops don't keep touching Telegram.
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Delete drafts synchronously. Backoff cap keeps this bounded.
+        for draft in self.drafts:
+            try:
+                await self._retry_with_backoff(
+                    lambda d=draft: self.bot.delete_message(
+                        chat_id=self.chat_id, message_id=d.message_id
+                    )
+                )
+                logger.debug(f"Deleted draft {draft.message_id}")
+            except TelegramError as e:
+                logger.error(f"Failed to delete draft {draft.message_id}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to delete draft {draft.message_id}: {e}")
+
+        self.drafts.clear()
+        self.accumulated_text = ""
+        self.tool_calls_text = ""
+        logger.debug(f"Cancelled streaming for user {self.user_id}")
+        return True
+
+    # --- Worker-side handlers (called from _worker_loop) ----------------
+
+    async def _do_render_text(self) -> None:
+        """Render current accumulated text to the draft, splitting on overflow.
+
+        Reads current self.accumulated_text rather than a chunk snapshot so
+        catching up after a stalled worker still converges to the correct state.
+        """
+        if len(self.accumulated_text) >= 4000:
+            await self.handle_overflow()
+            return
+
+        display_text = self._first_draft_prefix() + self.accumulated_text
+
+        if not self.drafts:
+            await self.create_draft(display_text)
+            return
+
+        current_draft = self.drafts[-1]
+        chars_since_update = len(display_text) - len(current_draft.text)
+        current_draft.char_count_since_update = chars_since_update
+
+        if self.should_update(current_draft, chars_since_update):
+            await self.update_draft(current_draft, display_text)
+
+    async def _do_render_tool_call(self) -> None:
+        """Render tool_calls prefix + accumulated text immediately.
+
+        Tool calls bypass the should_update throttle — they're rare and we
+        want them visible on the draft as soon as the worker gets to them.
+        Uses full tool_calls_text (not _first_draft_prefix) to preserve
+        existing behavior of showing tool history even past overflow.
+        """
         full_text = self.tool_calls_text + self.accumulated_text
-
-        # Create or update draft immediately (tool calls are important)
         if not self.drafts:
             await self.create_draft(full_text)
         else:
-            current_draft = self.drafts[-1]
-            await self.update_draft(current_draft, full_text)
+            await self.update_draft(self.drafts[-1], full_text)
 
-        return True
+    async def _do_finalize(self, done_event: asyncio.Event) -> None:
+        """Worker-side: flush final text to all drafts, then signal caller."""
+        try:
+            if self.drafts and self.accumulated_text:
+                current_draft = self.drafts[-1]
+                final_text = self._first_draft_prefix() + self.accumulated_text
+                if current_draft.text != final_text:
+                    current_draft.text = final_text
+            for draft in self.drafts:
+                await self.finalize_draft(draft)
+            logger.debug(
+                f"Finalized {len(self.drafts)} draft(s) for user {self.user_id}"
+            )
+        finally:
+            done_event.set()
 
-    async def _retry_with_backoff(self, operation, max_retries=3):
-        """Execute operation with exponential backoff on flood control errors."""
+    # --- Telegram API helpers -------------------------------------------
+
+    async def _retry_with_backoff(self, operation, max_retries=2):
+        """Short bounded backoff on flood control.
+
+        If Telegram asks us to wait longer than MAX_BACKOFF_SECONDS, raise
+        immediately instead of sleeping. The caller logs and moves on — a
+        subsequent op will retry the edit. This replaces the previous
+        behavior where a single 245s RetryAfter blocked the reader loop.
+        """
         for attempt in range(max_retries):
             try:
                 return await operation()
             except RetryAfter as e:
+                requested = float(
+                    e.retry_after if hasattr(e, "retry_after") else (2 ** attempt)
+                )
+                if requested > self.MAX_BACKOFF_SECONDS:
+                    logger.warning(
+                        f"Rate limited, retry_after={requested}s exceeds cap "
+                        f"{self.MAX_BACKOFF_SECONDS}s — dropping operation"
+                    )
+                    raise
                 if attempt == max_retries - 1:
                     raise
-                wait_time = (
-                    float(e.retry_after) if hasattr(e, "retry_after") else (2**attempt)
-                )
                 logger.warning(
-                    f"Rate limited, waiting {wait_time}s (retry {attempt + 1}/{max_retries})"
+                    f"Rate limited, waiting {requested}s "
+                    f"(retry {attempt + 1}/{max_retries})"
                 )
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(requested)
 
     @staticmethod
     def _extract_message_id(message: Any) -> Optional[int]:
@@ -259,123 +448,4 @@ class StreamingMessageHandler:
                 f"Created overflow draft, remaining {len(remaining_text)} chars"
             )
 
-        return True
-
-    async def update_if_needed(self, new_text_chunk: str) -> bool:
-        """
-        Main entry point: accumulate text and update draft if thresholds met.
-        Handles overflow to new drafts when exceeding 4000 chars.
-        """
-        if self._finalized:
-            return False
-
-        chunk_size = len(new_text_chunk)
-        logger.debug(
-            f"Received chunk: {chunk_size} chars, accumulated before: {len(self.accumulated_text)} chars"
-        )
-
-        # If chunk is large, simulate progressive updates
-        if chunk_size > self.min_chars:
-            # Split large chunk into smaller pieces for progressive updates
-            chunk_start = 0
-            while chunk_start < chunk_size:
-                chunk_end = min(chunk_start + self.min_chars, chunk_size)
-                partial_chunk = new_text_chunk[chunk_start:chunk_end]
-                self.accumulated_text += partial_chunk
-
-                # Check for overflow
-                if len(self.accumulated_text) >= 4000:
-                    await self.handle_overflow()
-                    chunk_start = chunk_end
-                    continue
-
-                display_text = self._first_draft_prefix() + self.accumulated_text
-                # Create first draft if needed
-                if not self.drafts:
-                    await self.create_draft(display_text)
-                else:
-                    # Update existing draft
-                    current_draft = self.drafts[-1]
-                    await self.update_draft(current_draft, display_text)
-
-                chunk_start = chunk_end
-            return True
-
-        # Small chunk - normal accumulation
-        self.accumulated_text += new_text_chunk
-        logger.debug(
-            f"Accumulated {len(self.accumulated_text)} chars (chunk: {chunk_size} chars)"
-        )
-
-        # Check for overflow
-        if len(self.accumulated_text) >= 4000:
-            await self.handle_overflow()
-            return True
-
-        display_text = self._first_draft_prefix() + self.accumulated_text
-
-        # Create first draft if needed
-        if not self.drafts:
-            await self.create_draft(display_text)
-            return True
-
-        # Update existing draft if thresholds met
-        current_draft = self.drafts[-1]
-        chars_since_update = len(display_text) - len(current_draft.text)
-        current_draft.char_count_since_update = chars_since_update
-
-        logger.debug(
-            f"Checking update: {chars_since_update} chars since last update, min_chars={self.min_chars}"
-        )
-
-        if self.should_update(current_draft, chars_since_update):
-            await self.update_draft(current_draft, display_text)
-            return True
-
-        return False
-
-    async def finalize_all(self) -> bool:
-        """Finalize all active draft messages"""
-        if self._finalized:
-            return False
-
-        self._finalized = True
-
-        # Update last draft with final accumulated text (include tool calls prefix for first draft)
-        if self.drafts and self.accumulated_text:
-            current_draft = self.drafts[-1]
-            final_text = self._first_draft_prefix() + self.accumulated_text
-            if current_draft.text != final_text:
-                current_draft.text = final_text
-
-        # Finalize all drafts
-        for draft in self.drafts:
-            await self.finalize_draft(draft)
-
-        logger.debug(f"Finalized {len(self.drafts)} draft(s) for user {self.user_id}")
-        return True
-
-    async def cancel(self) -> bool:
-        """Delete all unfinished draft messages and clean up state"""
-        if self._finalized:
-            return False
-
-        self._finalized = True
-
-        # Delete all draft messages
-        for draft in self.drafts:
-            try:
-                await self._retry_with_backoff(
-                    lambda: self.bot.delete_message(
-                        chat_id=self.chat_id, message_id=draft.message_id
-                    )
-                )
-                logger.debug(f"Deleted draft {draft.message_id}")
-            except TelegramError as e:
-                logger.error(f"Failed to delete draft {draft.message_id}: {e}")
-
-        self.drafts.clear()
-        self.accumulated_text = ""
-        self.tool_calls_text = ""
-        logger.debug(f"Cancelled streaming for user {self.user_id}")
         return True

@@ -157,7 +157,10 @@ class StreamingMessageHandlerTests(unittest.IsolatedAsyncioTestCase):
         ok = await handler.add_tool_call("Read", {"file_path": "/tmp/a.txt"})
 
         self.assertTrue(ok)
+        # State mutation is synchronous.
         self.assertIn("**Read**", handler.tool_calls_text)
+        # Telegram I/O is async via worker; wait for the queued op to drain.
+        await handler._queue.join()
         self.assertEqual(len(bot.calls), 1)
         self.assertEqual(bot.calls[0][0], "send_message")
         self.assertIn("/tmp/a.txt", bot.calls[0][2])

@@ -446,10 +446,18 @@ class ProjectChatHandler:
             except Exception as e:
                 logger.error(f"Error cancelling reader task for user {user_id}: {e}")
 
-        # Fail all pending requests
+        # Fail all pending requests. Also cancel any attached streaming handler
+        # so its worker task doesn't sit waiting on an empty queue forever.
         msg = cancel_message or "🛑 Task has been terminated."
         while state.pending:
             req = state.pending.popleft()
+            if req.streaming_handler:
+                try:
+                    await req.streaming_handler.cancel()
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling streaming handler for user {user_id}: {e}"
+                    )
             if not req.future.done():
                 try:
                     req.future.set_result(
@@ -855,6 +863,15 @@ class ProjectChatHandler:
                     state.pending.remove(request)
                 except ValueError:
                     pass
+            # Cancel the request's streaming worker — we removed it from pending
+            # above, so _disconnect_user_stream's cleanup loop won't catch it.
+            if streaming_handler:
+                try:
+                    await streaming_handler.cancel()
+                except Exception as cancel_err:
+                    logger.error(
+                        f"Error cancelling streaming handler on SDK error for user {user_id}: {cancel_err}"
+                    )
 
             err = str(e)
             err_type = type(e).__name__
