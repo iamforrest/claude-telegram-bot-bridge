@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/FORK_NOTES.md`, `docs/OPERATIONS.md`, `docs/DEVELOPMENT.md`, `docs/TROUBLESHOOTING.md` covering fork-specific deployment, operations, cross-machine development workflow, and troubleshooting
 - Categorize SDK errors into A (subscription quota exhausted) / B (server transient overload) / C (network/subprocess) / P (permanent), with Telegram notices at each retry transition so the user can see why each pause happened
 - Track the latest `RateLimitEvent` per user and skip retry while the rejection window is still active
+- Include `.md` in the auto-send file path whitelist (`_FILE_PATH_RE`) so Markdown files referenced by path are delivered as Telegram documents instead of inlined as long split text messages
 
 ### Changed (iamforrest fork)
 - Migrated from `claude-code-sdk` to `claude-agent-sdk` (>= 0.1.63); drops local monkey-patch for `rate_limit_event` parsing and for `SubprocessCLITransport._find_cli`

@@ -2562,7 +2562,7 @@ class TelegramBot:
 
     # Match both absolute (/foo/bar.png) and relative (foo/bar.png) file paths
     _FILE_PATH_RE = re.compile(
-        r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:png|jpg|jpeg|gif|webp|mp4|mp3|pdf|zip))",
+        r"(/?(?:[\w.@-]+/)+[\w.@-]+\.(?:png|jpg|jpeg|gif|webp|mp4|mp3|pdf|zip|md))",
         re.IGNORECASE,
     )
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
