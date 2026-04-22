@@ -87,6 +87,18 @@ class Config(BaseSettings):
         ),
     )
 
+    # Cancel an in-flight Claude query if reader_loop receives no SDK message
+    # for this many seconds. Catches stalled tool loops / wedged streams long
+    # before PROCESS_TIMEOUT (3600s default), so users see "stalled" instead
+    # of "typing forever".
+    idle_no_progress_seconds: int = Field(
+        default=600,
+        description=(
+            "Cancel an in-flight query if no SDK message is received for this "
+            "many seconds. Set high enough to allow legitimate long tool runs."
+        ),
+    )
+
     # Access Control - comma-separated list of allowed user IDs (if empty, allow all)
     allowed_user_ids: List[int] = Field(
         default_factory=list,
@@ -412,18 +424,26 @@ def setup_logging() -> None:
 
     is_debug = os.environ.get("BOT_DEBUG")
 
-    # Console handler - WARNING+ in non-debug, full level in debug
-    console_level = log_level if is_debug else logging.WARNING
-    logging.basicConfig(level=console_level, format=config.log_format)
+    # Configure the root logger directly. Previously basicConfig set the root
+    # to WARNING in non-debug mode, which silently dropped every INFO record
+    # before it could reach the file handler — bot.log effectively only ever
+    # held WARNING+, making post-mortems much harder than they should be.
+    root = logging.getLogger()
+    root.setLevel(log_level)
 
-    # File handler - write to project-root scoped runtime logs.
+    # Console handler — verbose in debug, WARNING+ otherwise.
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level if is_debug else logging.WARNING)
+    console_handler.setFormatter(formatter)
+    root.addHandler(console_handler)
+
+    # File handler — always at the configured log_level so bot.log is useful.
     logs_dir = config.logs_dir
     logs_dir.mkdir(parents=True, exist_ok=True)
-    # Always write to file, not just in debug mode
     fh = logging.FileHandler(logs_dir / "bot.log", encoding="utf-8")
     fh.setLevel(log_level)
     fh.setFormatter(formatter)
-    logging.getLogger().addHandler(fh)
+    root.addHandler(fh)
 
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)

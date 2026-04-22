@@ -212,6 +212,11 @@ TypingCallback = Callable[[], Awaitable[Any]]
 
 TYPING_INTERVAL = 4  # Telegram typing status expires after ~5s
 
+# Cancel an in-flight query if reader_loop sees no SDK message for this long.
+# Catches stalled tool loops or wedged streams without waiting for the much
+# larger PROCESS_TIMEOUT (3600s default) to fire.
+IDLE_NO_PROGRESS_SECONDS = int(getattr(config, "idle_no_progress_seconds", 600))
+
 
 @dataclass
 class ChatResponse:
@@ -253,6 +258,10 @@ class _UserStreamState:
     # A-class rejection event still in effect (resets_at in the future).
     # Consulted before retrying to avoid pointless retries during a quota block.
     last_rate_limit: Optional["RateLimitEvent"] = None
+    # Monotonic timestamp (event-loop clock) of the last SDK message we read,
+    # or of the most recent query submit. Idle watchdog cancels the active
+    # task if this falls more than IDLE_NO_PROGRESS_SECONDS behind now.
+    last_recv_at: float = 0.0
 
 
 class ProjectChatHandler:
@@ -523,20 +532,48 @@ class ProjectChatHandler:
     async def _typing_keepalive_loop(
         self, user_id: int, state: _UserStreamState
     ) -> None:
-        """Background task that sends typing actions at regular intervals.
+        """Background task that sends typing actions and watches for SDK stalls.
 
-        Keeps Telegram typing indicator alive during long tool calls when
-        the SDK stream emits no messages.
+        - Keeps Telegram typing indicator alive every TYPING_INTERVAL seconds
+          while a request is in flight.
+        - Idle watchdog: if reader_loop hasn't seen any SDK message for
+          IDLE_NO_PROGRESS_SECONDS, cancels the active task so the user gets
+          a stall notice instead of silently waiting for PROCESS_TIMEOUT.
         """
+        idle_warned = False
         try:
             while True:
                 await asyncio.sleep(TYPING_INTERVAL)
                 if not state.pending:
+                    idle_warned = False
                     continue
+
                 req = state.pending[0]
+                now = asyncio.get_event_loop().time()
+
+                # Idle watchdog. last_recv_at is initialized when the request
+                # is submitted, so a fresh request is never stale on the first
+                # tick. We only fire once per stall (idle_warned guard) to
+                # avoid cancelling the same task twice.
+                if (
+                    not idle_warned
+                    and state.last_recv_at > 0
+                    and now - state.last_recv_at > IDLE_NO_PROGRESS_SECONDS
+                ):
+                    idle_warned = True
+                    elapsed = now - state.last_recv_at
+                    logger.warning(
+                        f"Idle watchdog: no SDK message for {elapsed:.0f}s for user {user_id} "
+                        f"(threshold {IDLE_NO_PROGRESS_SECONDS}s) — cancelling active task"
+                    )
+                    active = self._active_tasks.get(user_id)
+                    if active and not active.done():
+                        active.cancel()
+                    # Don't continue with typing on a cancelled request.
+                    continue
+
                 if not req.typing_callback:
                     continue
-                now = asyncio.get_event_loop().time()
                 if now - req.last_typing_at < TYPING_INTERVAL:
                     continue
                 req.last_typing_at = now
@@ -554,17 +591,19 @@ class ProjectChatHandler:
     async def _reader_loop(self, user_id: int, state: _UserStreamState) -> None:
         try:
             async for msg in state.client.receive_messages():
+                # Liveness signal for the idle watchdog. We update on every
+                # message — including ones we'll skip below — so any SDK
+                # activity counts as progress.
+                state.last_recv_at = asyncio.get_event_loop().time()
+
                 if not state.pending:
                     continue
 
                 req = state.pending[0]
-                now = asyncio.get_event_loop().time()
-                if req.typing_callback and now - req.last_typing_at >= TYPING_INTERVAL:
-                    req.last_typing_at = now
-                    try:
-                        await req.typing_callback()
-                    except Exception:
-                        pass
+                # NOTE: typing_callback is no longer fired from reader_loop —
+                # the keepalive loop covers it every TYPING_INTERVAL anyway,
+                # and removing the duplicate avoids two concurrent typing
+                # calls competing for the httpx connection pool.
 
                 if isinstance(msg, RateLimitEvent):
                     info = msg.rate_limit_info
@@ -818,16 +857,30 @@ class ProjectChatHandler:
         try:
             state = await self._get_or_create_stream(user_id, model, new_session)
             async with state.send_lock:
-                request.sent_session_id = (
-                    session_id or state.last_session_id or "default"
-                )
+                # Resolve session_id with explicit precedence so we can log
+                # which source was used. "default" means a fresh SDK session;
+                # if we hit it unexpectedly that's the smoking gun for a
+                # context-loss complaint.
+                if session_id:
+                    request.sent_session_id = session_id
+                    sid_source = "caller"
+                elif state.last_session_id:
+                    request.sent_session_id = state.last_session_id
+                    sid_source = "state"
+                else:
+                    request.sent_session_id = "default"
+                    sid_source = "default(new-session)"
+
                 state.pending.append(request)
+                # Reset idle watchdog clock — fresh request gets a full
+                # IDLE_NO_PROGRESS_SECONDS window before it can be flagged.
+                state.last_recv_at = asyncio.get_event_loop().time()
                 await state.client.query(
                     user_message, session_id=request.sent_session_id
                 )
                 logger.info(
                     f"Submitted message to live stream: user={user_id}, pending={len(state.pending)}, "
-                    f"session_key={request.sent_session_id}"
+                    f"session_key={request.sent_session_id} (source={sid_source})"
                 )
                 if config.claude_cli_path:
                     logger.info(
@@ -957,12 +1010,14 @@ class ProjectChatHandler:
                             session_id or retry_state.last_session_id or "default"
                         )
                         retry_state.pending.append(retry_request)
+                        retry_state.last_recv_at = asyncio.get_event_loop().time()
                         await retry_state.client.query(
                             user_message, session_id=retry_request.sent_session_id
                         )
                         logger.info(
-                            "✅ Retry submitted successfully for user %s after reconnection",
+                            "✅ Retry submitted successfully for user %s after reconnection (session_key=%s)",
                             user_id,
+                            retry_request.sent_session_id,
                         )
                     return await asyncio.wait_for(retry_future, timeout=PROCESS_TIMEOUT)
                 except Exception as retry_err:

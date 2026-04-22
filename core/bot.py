@@ -137,9 +137,13 @@ class TelegramBot:
             or os.environ.get("https_proxy")
             or os.environ.get("http_proxy")
         )
+        # Pool sized for concurrent streaming worker + typing keepalive +
+        # reply notices + permission prompts. Old 8/3.0s exhausted under load
+        # and surfaced as a "Pool timeout" cascade that swallowed even the
+        # "queue full" reply, leaving the user with no UX feedback.
         return HTTPXRequest(
-            connection_pool_size=8,
-            pool_timeout=3.0,
+            connection_pool_size=32,
+            pool_timeout=10.0,
             read_timeout=10.0,
             write_timeout=10.0,
             connect_timeout=5.0,

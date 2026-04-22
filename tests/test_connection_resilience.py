@@ -93,9 +93,9 @@ class TestConnectionResilience(unittest.TestCase):
         self.assertEqual(polling_request["pool_timeout"], 5.0)
         self.assertEqual(polling_request["http_version"], "1.1")
 
-        self.assertEqual(default_request["connection_pool_size"], 8)
+        self.assertEqual(default_request["connection_pool_size"], 32)
         self.assertEqual(default_request["read_timeout"], 10.0)
-        self.assertEqual(default_request["pool_timeout"], 3.0)
+        self.assertEqual(default_request["pool_timeout"], 10.0)
         self.assertEqual(default_request["http_version"], "1.1")
 
     @patch.dict(
