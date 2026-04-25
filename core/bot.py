@@ -734,15 +734,32 @@ class TelegramBot:
             self._runtime_active_sessions.add(user_id)
 
     def _effective_session_id(self, user_id: int, session: dict) -> Optional[str]:
-        """Prevent cross-process auto-resume from persisted session data."""
+        """Resolve session_id for the next process_message call.
+
+        Trusts the persisted session_id even after a process restart. The
+        previous version rejected it to "prevent cross-process auto-resume",
+        but in single-instance deployments that just meant every restart
+        silently dropped the conversation context. The Claude SDK handles a
+        stale session gracefully (starts a new one if it can't resume), so
+        the safety net cost more than it bought.
+        """
         session_id = session.get("session_id")
+        # Diagnostic — surface the input dict so we can see why session_id
+        # is sometimes missing after a restart even though sessions.json on
+        # disk still has it.
+        logger.info(
+            f"_effective_session_id: user={user_id}, session_id={session_id!r}, "
+            f"in_runtime_active={user_id in self._runtime_active_sessions}, "
+            f"session_keys={sorted(session.keys())}"
+        )
         if not session_id:
             return None
         if user_id not in self._runtime_active_sessions:
             logger.info(
-                f"Ignoring persisted session_id for user {user_id} (not active in current runtime)"
+                f"Restoring persisted session_id={session_id} for user {user_id} "
+                f"(first lookup since restart)"
             )
-            return None
+            self._runtime_active_sessions.add(user_id)
         return session_id
 
     @staticmethod

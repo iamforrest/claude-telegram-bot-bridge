@@ -420,6 +420,35 @@ class ProjectChatHandler:
                         return
                     _t.sleep(0.1)
 
+    async def _discard_completed_pending_head(
+        self, user_id: int, state: _UserStreamState, reason: str
+    ) -> int:
+        """Drop completed/cancelled requests that can no longer receive results.
+
+        `asyncio.wait_for(future, ...)` cancels the future on timeout. If that
+        request remains at the head of `state.pending`, the next SDK
+        ResultMessage is delivered to the stale request and the real request
+        behind it eventually times out later. Keep the queue head live before
+        reading or submitting SDK messages.
+        """
+        dropped = 0
+        while state.pending and state.pending[0].future.done():
+            req = state.pending.popleft()
+            dropped += 1
+            if req.streaming_handler:
+                try:
+                    await req.streaming_handler.cancel()
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling stale streaming handler for user {user_id}: {e}"
+                    )
+            logger.warning(
+                f"Dropped completed pending request for user {user_id} "
+                f"(reason={reason}, sent_session_id={req.sent_session_id}, "
+                f"remaining={len(state.pending)})"
+            )
+        return dropped
+
     async def _disconnect_user_stream(
         self, user_id: int, cancel_message: Optional[str] = None
     ) -> bool:
@@ -469,12 +498,21 @@ class ProjectChatHandler:
                     )
             if not req.future.done():
                 try:
+                    response_session_id = (
+                        state.last_session_id
+                        or req.requested_session_id
+                        or (
+                            req.sent_session_id
+                            if req.sent_session_id != "default"
+                            else None
+                        )
+                    )
                     req.future.set_result(
                         ChatResponse(
                             content=msg,
                             success=False,
                             error=msg,
-                            session_id=state.last_session_id,
+                            session_id=response_session_id,
                         )
                     )
                 except Exception as e:
@@ -554,7 +592,16 @@ class ProjectChatHandler:
                 # Idle watchdog. last_recv_at is initialized when the request
                 # is submitted, so a fresh request is never stale on the first
                 # tick. We only fire once per stall (idle_warned guard) to
-                # avoid cancelling the same task twice.
+                # avoid double-disconnecting.
+                #
+                # We disconnect the wedged stream directly rather than calling
+                # task.cancel() — `_active_tasks[user_id]` only stores the LAST
+                # process_message task and is wiped by `finally: pop()` when ANY
+                # of the user's process_message calls returns, so the cancel
+                # target is unreliable when multiple messages are queued.
+                # _disconnect_user_stream cleanly fails every pending future,
+                # tears down the SDK subprocess, and lets the next request
+                # rebuild the stream with the same session_id.
                 if (
                     not idle_warned
                     and state.last_recv_at > 0
@@ -562,15 +609,28 @@ class ProjectChatHandler:
                 ):
                     idle_warned = True
                     elapsed = now - state.last_recv_at
+                    pending_count = len(state.pending)
                     logger.warning(
                         f"Idle watchdog: no SDK message for {elapsed:.0f}s for user {user_id} "
-                        f"(threshold {IDLE_NO_PROGRESS_SECONDS}s) — cancelling active task"
+                        f"(threshold {IDLE_NO_PROGRESS_SECONDS}s, pending={pending_count}) "
+                        f"— disconnecting wedged stream"
                     )
-                    active = self._active_tasks.get(user_id)
-                    if active and not active.done():
-                        active.cancel()
-                    # Don't continue with typing on a cancelled request.
-                    continue
+                    # Run disconnect off-task: _disconnect_user_stream cancels
+                    # this typing task as part of cleanup, so awaiting it inline
+                    # would self-cancel mid-cleanup.
+                    asyncio.create_task(
+                        self._disconnect_user_stream(
+                            user_id,
+                            cancel_message=(
+                                f"⏸️ SDK stalled — no progress for "
+                                f"{int(elapsed)}s (threshold "
+                                f"{IDLE_NO_PROGRESS_SECONDS}s). "
+                                f"Cancelled. Send the message again to retry."
+                            ),
+                        )
+                    )
+                    # The disconnect will cancel us; bail out of the loop.
+                    return
 
                 if not req.typing_callback:
                     continue
@@ -596,6 +656,9 @@ class ProjectChatHandler:
                 # activity counts as progress.
                 state.last_recv_at = asyncio.get_event_loop().time()
 
+                await self._discard_completed_pending_head(
+                    user_id, state, "before-reader-dispatch"
+                )
                 if not state.pending:
                     continue
 
@@ -857,6 +920,9 @@ class ProjectChatHandler:
         try:
             state = await self._get_or_create_stream(user_id, model, new_session)
             async with state.send_lock:
+                await self._discard_completed_pending_head(
+                    user_id, state, "before-submit"
+                )
                 # Resolve session_id with explicit precedence so we can log
                 # which source was used. "default" means a fresh SDK session;
                 # if we hit it unexpectedly that's the smoking gun for a
@@ -905,10 +971,40 @@ class ProjectChatHandler:
             logger.warning(
                 f"Query timed out for user {user_id} after {PROCESS_TIMEOUT}s"
             )
+            if state and request in state.pending:
+                try:
+                    state.pending.remove(request)
+                    logger.warning(
+                        f"Removed timed-out pending request for user {user_id} "
+                        f"(remaining={len(state.pending)})"
+                    )
+                except ValueError:
+                    pass
+            if streaming_handler:
+                try:
+                    await streaming_handler.cancel()
+                except Exception as e:
+                    logger.error(
+                        f"Failed to cancel streaming handler after timeout for user {user_id}: {e}"
+                    )
             await self.stop(user_id)
             msg = f"⏰ Timed out after {PROCESS_TIMEOUT}s. Please retry or simplify your request."
             health_reporter.record_claude_error(msg)
-            return ChatResponse(content=msg, success=False, error=msg)
+            response_session_id = (
+                (state.last_session_id if state else None)
+                or request.requested_session_id
+                or (
+                    request.sent_session_id
+                    if request.sent_session_id != "default"
+                    else None
+                )
+            )
+            return ChatResponse(
+                content=msg,
+                success=False,
+                error=msg,
+                session_id=response_session_id,
+            )
 
         except Exception as e:
             if state and request in state.pending:
