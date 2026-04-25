@@ -232,8 +232,10 @@ class ChatResponse:
 
 @dataclass
 class _PendingRequest:
+    request_id: int
     user_id: int
     chat_id: int
+    user_message: str
     model: Optional[str]
     requested_session_id: Optional[str]
     permission_callback: Optional[PermissionCallback]
@@ -244,6 +246,7 @@ class _PendingRequest:
     last_assistant_texts: List[str] = field(default_factory=list)
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
+    submitted: bool = False
 
 
 @dataclass
@@ -268,8 +271,9 @@ class ProjectChatHandler:
     """
     Handles Telegram messages using a per-user long-lived Claude SDK stream.
 
-    This allows multiple messages to be submitted quickly to the same live session
-    before earlier responses are fully returned.
+    Messages are accepted concurrently but submitted to the SDK one at a time.
+    The SDK result stream is single-lane, so serializing submissions keeps each
+    ResultMessage matched to the Telegram request that produced it.
     """
 
     def __init__(self):
@@ -277,7 +281,12 @@ class ProjectChatHandler:
         self._active_tasks: Dict[int, asyncio.Task] = {}
         self._streams: Dict[int, _UserStreamState] = {}
         self._stream_init_locks: Dict[int, asyncio.Lock] = {}
+        self._next_request_id = 0
         logger.info(f"ProjectChatHandler initialized for {self.project_root}")
+
+    def _allocate_request_id(self) -> int:
+        self._next_request_id += 1
+        return self._next_request_id
 
     def _get_stream_init_lock(self, user_id: int) -> asyncio.Lock:
         lock = self._stream_init_locks.get(user_id)
@@ -444,10 +453,44 @@ class ProjectChatHandler:
                     )
             logger.warning(
                 f"Dropped completed pending request for user {user_id} "
-                f"(reason={reason}, sent_session_id={req.sent_session_id}, "
+                f"(reason={reason}, request_id={req.request_id}, "
+                f"sent_session_id={req.sent_session_id}, "
                 f"remaining={len(state.pending)})"
             )
         return dropped
+
+    async def _submit_next_pending(
+        self, user_id: int, state: _UserStreamState, reason: str
+    ) -> bool:
+        await self._discard_completed_pending_head(user_id, state, reason)
+        if not state.pending:
+            return False
+
+        req = state.pending[0]
+        if req.submitted:
+            return False
+
+        if req.requested_session_id:
+            req.sent_session_id = req.requested_session_id
+            sid_source = "caller"
+        elif state.last_session_id:
+            req.sent_session_id = state.last_session_id
+            sid_source = "state"
+        else:
+            req.sent_session_id = "default"
+            sid_source = "default(new-session)"
+
+        req.submitted = True
+        state.last_recv_at = asyncio.get_event_loop().time()
+        await state.client.query(req.user_message, session_id=req.sent_session_id)
+        logger.info(
+            f"Submitted message to live stream: user={user_id}, request_id={req.request_id}, "
+            f"pending={len(state.pending)}, session_key={req.sent_session_id} "
+            f"(source={sid_source}, reason={reason})"
+        )
+        if config.claude_cli_path:
+            logger.info(f"Using configured Claude CLI path: {config.claude_cli_path}")
+        return True
 
     async def _disconnect_user_stream(
         self, user_id: int, cancel_message: Optional[str] = None
@@ -834,6 +877,13 @@ class ProjectChatHandler:
                         except Exception as e:
                             logger.error(f"Error setting future result: {e}")
                     state.pending.popleft()
+                    logger.info(
+                        f"Completed pending request: user={user_id}, request_id={req.request_id}, "
+                        f"remaining={len(state.pending)}"
+                    )
+                    await self._submit_next_pending(
+                        user_id, state, "after-result"
+                    )
         except asyncio.CancelledError:
             logger.debug(f"Reader loop cancelled for user {user_id}")
             raise
@@ -906,8 +956,10 @@ class ProjectChatHandler:
             streaming_handler = StreamingMessageHandler(bot, chat_id, user_id)
 
         request = _PendingRequest(
+            request_id=self._allocate_request_id(),
             user_id=user_id,
             chat_id=chat_id,
+            user_message=user_message,
             model=model,
             requested_session_id=session_id,
             permission_callback=permission_callback,
@@ -921,34 +973,24 @@ class ProjectChatHandler:
             state = await self._get_or_create_stream(user_id, model, new_session)
             async with state.send_lock:
                 await self._discard_completed_pending_head(
-                    user_id, state, "before-submit"
+                    user_id, state, "before-queue"
                 )
-                # Resolve session_id with explicit precedence so we can log
-                # which source was used. "default" means a fresh SDK session;
-                # if we hit it unexpectedly that's the smoking gun for a
-                # context-loss complaint.
-                if session_id:
-                    request.sent_session_id = session_id
-                    sid_source = "caller"
-                elif state.last_session_id:
-                    request.sent_session_id = state.last_session_id
-                    sid_source = "state"
-                else:
-                    request.sent_session_id = "default"
-                    sid_source = "default(new-session)"
-
+                was_idle = not state.pending
                 state.pending.append(request)
-                # Reset idle watchdog clock — fresh request gets a full
-                # IDLE_NO_PROGRESS_SECONDS window before it can be flagged.
-                state.last_recv_at = asyncio.get_event_loop().time()
-                await state.client.query(
-                    user_message, session_id=request.sent_session_id
-                )
                 logger.info(
-                    f"Submitted message to live stream: user={user_id}, pending={len(state.pending)}, "
-                    f"session_key={request.sent_session_id} (source={sid_source})"
+                    f"Queued message for live stream: user={user_id}, "
+                    f"request_id={request.request_id}, pending={len(state.pending)}, "
+                    f"was_idle={was_idle}"
                 )
-                if config.claude_cli_path:
+                if was_idle:
+                    await self._submit_next_pending(user_id, state, "new-head")
+                else:
+                    logger.info(
+                        f"Deferred SDK submit until earlier request completes: "
+                        f"user={user_id}, request_id={request.request_id}, "
+                        f"head_request_id={state.pending[0].request_id}"
+                    )
+                if config.claude_cli_path and not was_idle:
                     logger.info(
                         f"Using configured Claude CLI path: {config.claude_cli_path}"
                     )
@@ -1088,8 +1130,10 @@ class ProjectChatHandler:
 
                     retry_handler = StreamingMessageHandler(bot, chat_id, user_id)
                 retry_request = _PendingRequest(
+                    request_id=self._allocate_request_id(),
                     user_id=user_id,
                     chat_id=chat_id,
+                    user_message=user_message,
                     model=model,
                     requested_session_id=session_id,
                     permission_callback=permission_callback,
@@ -1102,13 +1146,9 @@ class ProjectChatHandler:
                         user_id, model, new_session=False
                     )
                     async with retry_state.send_lock:
-                        retry_request.sent_session_id = (
-                            session_id or retry_state.last_session_id or "default"
-                        )
                         retry_state.pending.append(retry_request)
-                        retry_state.last_recv_at = asyncio.get_event_loop().time()
-                        await retry_state.client.query(
-                            user_message, session_id=retry_request.sent_session_id
+                        await self._submit_next_pending(
+                            user_id, retry_state, "retry"
                         )
                         logger.info(
                             "✅ Retry submitted successfully for user %s after reconnection (session_key=%s)",
