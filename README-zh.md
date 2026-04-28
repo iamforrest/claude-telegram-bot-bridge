@@ -227,6 +227,7 @@ Claude:  ...
 | `/model` | 切换模型（Sonnet / Opus / Haiku） |
 | `/resume` | 浏览并恢复历史会话（显示进度摘要及最后一条助手消息） |
 | `/stop` | 立即中断执行（绕过队列限制，取消活动任务） |
+| `/restart` | 重启机器人进程以重新加载 shell 环境变量（如 `~/.zshrc`） |
 | `/history` | 查看最近对话历史 |
 | `/revert` | 回退到历史对话状态（浏览历史记录，选择消息，选择恢复模式） |
 | `/skills` | 列出可用的 Claude Code 技能 |

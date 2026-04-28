@@ -230,6 +230,7 @@ Claude: ...
 | `/model` | Switch model (Sonnet / Opus / Haiku) |
 | `/resume` | Browse and resume a previous session (shows progress summary with last assistant message) |
 | `/stop` | Interrupt execution immediately (bypasses queue, cancels active task) |
+| `/restart` | Restart the bot process to reload shell environment variables (e.g. `~/.zshrc`) |
 | `/history` | View recent conversation history |
 | `/revert` | Revert to a previous conversation state (browse history, select message, choose restore mode) |
 | `/skills` | List available Claude Code skills |
