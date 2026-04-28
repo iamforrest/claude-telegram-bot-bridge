@@ -8,6 +8,7 @@ import shlex
 import signal
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path as FilePath
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
@@ -779,6 +780,7 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("model", self._cmd_model))
         self.application.add_handler(CommandHandler("resume", self._cmd_resume))
         self.application.add_handler(CommandHandler("stop", self._cmd_stop))
+        self.application.add_handler(CommandHandler("restart", self._cmd_restart))
         self.application.add_handler(CommandHandler("history", self._cmd_history))
         self.application.add_handler(CommandHandler("revert", self._cmd_revert))
         self.application.add_handler(CommandHandler("command", self._cmd_command))
@@ -1081,6 +1083,54 @@ class TelegramBot:
             reply = "ℹ️ Nothing running"
         await message.reply_text(reply)
         log_debug(user_id, "bot", reply)
+
+    async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Re-exec the bot process to reload environment variables.
+
+        Uses os.execv via `zsh -c` so the new image inherits a freshly
+        evaluated shell environment (~/.zshenv applies to all zsh
+        invocations). PID stays the same — supervisor/launchd see no
+        child death and won't bump crash counters.
+        """
+        if not await self._check_access(update):
+            return
+        user_id = self._require_user(update).id
+        message = self._require_message(update)
+        log_debug(user_id, "command", "/restart")
+
+        await message.reply_text("♻️ Restarting...")
+
+        # exec(2) keeps child PIDs alive across the image swap, so SDK
+        # subprocesses must be torn down explicitly or they orphan and
+        # the new bot will spin up duplicates.
+        for uid in list(project_chat_handler._streams.keys()):
+            try:
+                await project_chat_handler.stop(uid)
+            except Exception as e:
+                logger.warning("restart: stop(%s) failed: %s", uid, e)
+        for uid in list(self._user_voice_tasks.keys()):
+            await self._cancel_user_voice_tasks(uid)
+        for task in list(self._active_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+
+        project_root = os.environ.get("PROJECT_ROOT", "")
+        debug_flag = " --debug" if os.environ.get("BOT_DEBUG") else ""
+        cmd = (
+            f"exec {shlex.quote(sys.executable)} -m telegram_bot "
+            f"--path {shlex.quote(project_root)}{debug_flag}"
+        )
+        logger.warning("Re-exec for /restart: zsh -c %s", cmd)
+
+        # exec wipes process memory immediately — flush log handlers
+        # last so the re-exec line actually reaches disk.
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+
+        os.execv("/bin/zsh", ["zsh", "-c", cmd])
 
     async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /history - display recent messages from current session."""
@@ -3031,6 +3081,7 @@ class TelegramBot:
         commands = [
             BotCommand("new", "New session"),
             BotCommand("stop", "Stop execution"),
+            BotCommand("restart", "Restart bot to reload env"),
             BotCommand("model", "Switch model"),
             BotCommand("resume", "Resume session"),
             BotCommand("history", "View message history"),
