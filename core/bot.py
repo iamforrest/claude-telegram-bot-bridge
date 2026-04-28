@@ -1087,10 +1087,11 @@ class TelegramBot:
     async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Re-exec the bot process to reload environment variables.
 
-        Uses os.execv via `zsh -c` so the new image inherits a freshly
-        evaluated shell environment (~/.zshenv applies to all zsh
-        invocations). PID stays the same — supervisor/launchd see no
-        child death and won't bump crash counters.
+        Uses os.execv via `zsh -ic` so the new image inherits a freshly
+        evaluated shell environment including ~/.zshrc (interactive
+        config — only loaded when -i is set). PID stays the same —
+        supervisor/launchd see no child death and won't bump crash
+        counters.
         """
         if not await self._check_access(update):
             return
@@ -1120,7 +1121,7 @@ class TelegramBot:
             f"exec {shlex.quote(sys.executable)} -m telegram_bot "
             f"--path {shlex.quote(project_root)}{debug_flag}"
         )
-        logger.warning("Re-exec for /restart: zsh -c %s", cmd)
+        logger.warning("Re-exec for /restart: zsh -ic %s", cmd)
 
         # exec wipes process memory immediately — flush log handlers
         # last so the re-exec line actually reaches disk.
@@ -1130,7 +1131,7 @@ class TelegramBot:
             except Exception:
                 pass
 
-        os.execv("/bin/zsh", ["zsh", "-c", cmd])
+        os.execv("/bin/zsh", ["zsh", "-ic", cmd])
 
     async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /history - display recent messages from current session."""
