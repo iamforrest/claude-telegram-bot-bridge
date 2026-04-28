@@ -116,7 +116,38 @@ class TelegramBot:
         if removed:
             logger.info("Startup audio cleanup removed %s stale file(s)", removed)
         await self._set_bot_commands()
+        await self._ack_restart_hint(application)
         logger.info("Bot initialization complete")
+
+    async def _ack_restart_hint(self, application: Application):
+        """Acknowledge a /restart triggered before this process started.
+
+        /restart writes a hint file before os.execv; we read it here so the
+        user gets a "✅ Restarted" reply tied to their original command
+        message. 60s freshness window prevents a stale hint from firing on
+        the next ordinary launch if the restart itself failed.
+        """
+        hint_path = config.bot_data_dir / ".restart_hint.json"
+        if not hint_path.exists():
+            return
+        try:
+            data = json.loads(hint_path.read_text())
+            elapsed = time.time() - float(data.get("ts", 0))
+            chat_id = data.get("chat_id")
+            reply_to = data.get("message_id")
+            if chat_id and 0 <= elapsed <= 60:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Restarted ({elapsed:.1f}s)",
+                    reply_to_message_id=reply_to,
+                )
+        except Exception as e:
+            logger.warning("restart: failed to ack hint: %s", e)
+        finally:
+            try:
+                hint_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def build(self):
         """Build the application (no post_init — lifecycle managed manually)."""
@@ -1099,7 +1130,21 @@ class TelegramBot:
         message = self._require_message(update)
         log_debug(user_id, "command", "/restart")
 
-        await message.reply_text("♻️ Restarting...")
+        ack_msg = await message.reply_text("♻️ Restarting...")
+
+        # Drop a hint so the post-exec process can ack the right user.
+        try:
+            hint_path = config.bot_data_dir / ".restart_hint.json"
+            hint_path.write_text(
+                json.dumps({
+                    "user_id": user_id,
+                    "chat_id": message.chat_id,
+                    "message_id": ack_msg.message_id if ack_msg else None,
+                    "ts": time.time(),
+                })
+            )
+        except Exception as e:
+            logger.warning("restart: failed to write hint file: %s", e)
 
         # exec(2) keeps child PIDs alive across the image swap, so SDK
         # subprocesses must be torn down explicitly or they orphan and
