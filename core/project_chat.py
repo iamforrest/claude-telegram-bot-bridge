@@ -372,6 +372,8 @@ class ProjectChatHandler:
             opts["model"] = model
         if config.claude_cli_path:
             opts["cli_path"] = str(config.claude_cli_path)
+        if config.claude_chrome_enabled:
+            opts["extra_args"] = {"chrome": None}
 
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
         await client.connect()

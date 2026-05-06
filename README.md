@@ -247,6 +247,7 @@ Any unrecognized `/command` is also forwarded as a skill invocation.
 | `ALLOWED_USER_IDS` | No | *(allow all)* | Comma-separated user ID whitelist |
 | `CLAUDE_CLI_PATH` | No | *(auto-detect)* | Absolute path to Claude CLI binary |
 | `CLAUDE_SETTINGS_PATH` | No | `~/.claude/settings.json` | Path to Claude Code settings file |
+| `CLAUDE_CHROME_ENABLED` | No | `false` | Pass `--chrome` to the bundled CLI so Telegram sessions can drive Chrome via the [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn). Requires extension installed + direct Anthropic plan (Pro/Max/Team/Enterprise) |
 | `CLAUDE_PROCESS_TIMEOUT` | No | `600` | SDK timeout in seconds |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | No | `24` | Auto-start new session after N hours of inactivity; set to `0`/`false`/`off` to disable |
 | `DRAFT_UPDATE_MIN_CHARS` | No | `150` | Minimum characters before streaming draft update |

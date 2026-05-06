@@ -46,6 +46,14 @@ class Config(BaseSettings):
     claude_settings_path: Path = Field(
         default=CLAUDE_SETTINGS_PATH, description="Path to Claude Code settings.json"
     )
+    claude_chrome_enabled: bool = Field(
+        default=False,
+        description=(
+            "Pass --chrome to the bundled Claude CLI so the session can drive "
+            "the Chrome browser via the Claude in Chrome extension. Requires "
+            "the extension installed and a direct Anthropic plan."
+        ),
+    )
 
     # Telegram Bot
     telegram_bot_token: str = Field(..., description="Telegram Bot API Token")

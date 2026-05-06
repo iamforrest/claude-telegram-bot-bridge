@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - fork additions
 
 ### Added (iamforrest fork)
+- `CLAUDE_CHROME_ENABLED` env flag: when `1`/`true`, pass `--chrome` to the bundled Claude CLI so Telegram sessions can drive Chrome via the [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn) (requires extension installed + direct Anthropic plan)
 - `docs/FORK_NOTES.md`, `docs/OPERATIONS.md`, `docs/DEVELOPMENT.md`, `docs/TROUBLESHOOTING.md` covering fork-specific deployment, operations, cross-machine development workflow, and troubleshooting
 - Categorize SDK errors into A (subscription quota exhausted) / B (server transient overload) / C (network/subprocess) / P (permanent), with Telegram notices at each retry transition so the user can see why each pause happened
 - Track the latest `RateLimitEvent` per user and skip retry while the rejection window is still active

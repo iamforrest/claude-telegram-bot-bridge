@@ -244,6 +244,7 @@ Claude:  ...
 | `ALLOWED_USER_IDS` | 否 | *（允许所有人）* | 逗号分隔的用户 ID 白名单 |
 | `CLAUDE_CLI_PATH` | 否 | *（自动检测）* | Claude CLI 绝对路径 |
 | `CLAUDE_SETTINGS_PATH` | 否 | `~/.claude/settings.json` | Claude Code settings 文件路径 |
+| `CLAUDE_CHROME_ENABLED` | 否 | `false` | 给底层 CLI 加 `--chrome` 让 Telegram 会话通过 [Claude in Chrome 扩展](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn) 控制 Chrome 浏览器。需安装扩展 + Anthropic 直连套餐（Pro/Max/Team/Enterprise） |
 | `CLAUDE_PROCESS_TIMEOUT` | 否 | `600` | SDK 超时时间（秒） |
 | `AUTO_NEW_SESSION_AFTER_HOURS` | 否 | `24` | 空闲 N 小时后自动启动新会话；设为 `0`/`false`/`off` 禁用 |
 | `DRAFT_UPDATE_MIN_CHARS` | 否 | `150` | 流式响应草稿更新的最小字符数 |

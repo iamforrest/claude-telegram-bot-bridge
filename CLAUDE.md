@@ -98,6 +98,7 @@ utils/chat_logger.py Per-session debug chat logging
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram Bot API token |
 | `ALLOWED_USER_IDS` | No | Comma-separated user IDs; empty = allow all |
 | `CLAUDE_CLI_PATH` | No | Absolute path to Claude CLI binary |
+| `CLAUDE_CHROME_ENABLED` | No | If `1`/`true`, pass `--chrome` to the bundled CLI so the session can drive Chrome via the Claude in Chrome extension (default: `false`) |
 | `CLAUDE_PROCESS_TIMEOUT` | No | SDK timeout in seconds (default: 600) |
 | `PROXY_URL` | No | HTTP proxy; start.sh auto-configures env vars |
 | `PROJECT_ROOT` | Set by start.sh | Base path for all file access validation |
