@@ -19,6 +19,12 @@ def _normalize_reason(value: Optional[str]) -> str:
     return " ".join(str(value).split())[:500]
 
 
+def _normalize_preview(value: Optional[str], limit: int = 160) -> str:
+    if not value:
+        return ""
+    return " ".join(str(value).split())[:limit]
+
+
 class RuntimeHealthReporter:
     SCHEMA_VERSION = 1
 
@@ -55,6 +61,11 @@ class RuntimeHealthReporter:
                 "last_ok_at": None,
                 "last_error_at": None,
                 "last_error": "",
+            },
+            "runtime": {
+                "last_update_received_at": None,
+                "last_user_message_at": None,
+                "users": {},
             },
         }
 
@@ -145,6 +156,81 @@ class RuntimeHealthReporter:
         one from the outside.
         """
         with self._lock:
+            self._write_health_locked()
+
+    def _user_runtime_locked(self, user_id: int) -> dict[str, Any]:
+        users = self._state.setdefault("runtime", {}).setdefault("users", {})
+        key = str(user_id)
+        user = users.get(key)
+        if not isinstance(user, dict):
+            user = {}
+            users[key] = user
+        return user
+
+    def record_update_received(
+        self,
+        *,
+        user_id: Optional[int],
+        chat_id: Optional[int],
+        message_id: Optional[int],
+        text_preview: str = "",
+        source: str = "text",
+    ) -> None:
+        with self._lock:
+            now = _utc_now_iso()
+            runtime = self._state.setdefault("runtime", {})
+            runtime["last_update_received_at"] = now
+            if user_id is not None:
+                runtime["last_user_message_at"] = now
+                user = self._user_runtime_locked(user_id)
+                user.update(
+                    {
+                        "last_update_received_at": now,
+                        "last_user_message_at": now,
+                        "last_chat_id": chat_id,
+                        "last_message_id": message_id,
+                        "last_message_source": source,
+                        "last_message_preview": _normalize_preview(text_preview),
+                    }
+                )
+            self._write_health_locked()
+
+    def record_user_queue(
+        self,
+        *,
+        user_id: int,
+        queued_tasks: int,
+        active: bool,
+        event: str,
+    ) -> None:
+        with self._lock:
+            user = self._user_runtime_locked(user_id)
+            user["queued_tasks"] = queued_tasks
+            user["active_task"] = active
+            user["last_queue_event"] = event
+            user["last_queue_event_at"] = _utc_now_iso()
+            self._write_health_locked()
+
+    def record_sdk_pending(
+        self,
+        *,
+        user_id: int,
+        pending: int,
+        head_request_id: Optional[int],
+        current_request_age_seconds: Optional[float],
+        event: str,
+    ) -> None:
+        with self._lock:
+            user = self._user_runtime_locked(user_id)
+            user["sdk_pending"] = pending
+            user["sdk_head_request_id"] = head_request_id
+            user["sdk_current_request_age_seconds"] = (
+                None
+                if current_request_age_seconds is None
+                else round(current_request_age_seconds, 1)
+            )
+            user["last_sdk_event"] = event
+            user["last_sdk_event_at"] = _utc_now_iso()
             self._write_health_locked()
 
     def record_telegram_ok(self) -> None:

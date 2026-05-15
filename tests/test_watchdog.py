@@ -123,6 +123,51 @@ class TestPollingWatchdog(unittest.TestCase):
         mock_updater.stop.assert_awaited_once()
 
 
+class TestUserTaskQueue(unittest.TestCase):
+    """Test per-user task execution discipline."""
+
+    def setUp(self):
+        self.bot = TelegramBot()
+
+    def test_user_tasks_run_serially(self):
+        events = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def first_task():
+            events.append("first:start")
+            first_started.set()
+            await release_first.wait()
+            events.append("first:end")
+
+        async def second_task():
+            events.append("second:start")
+            events.append("second:end")
+
+        async def overflow():
+            events.append("overflow")
+
+        async def run():
+            accepted_first = await self.bot._enqueue_user_task(123, first_task, overflow)
+            accepted_second = await self.bot._enqueue_user_task(123, second_task, overflow)
+            self.assertTrue(accepted_first)
+            self.assertTrue(accepted_second)
+
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await asyncio.sleep(0.03)
+            self.assertEqual(events, ["first:start"])
+
+            release_first.set()
+            await asyncio.gather(*list(self.bot._user_run_tasks[123]))
+
+        asyncio.run(run())
+
+        self.assertEqual(
+            events,
+            ["first:start", "first:end", "second:start", "second:end"],
+        )
+
+
 class TestWaitForPollingExit(unittest.TestCase):
     """Test _wait_for_polling_exit detects terminal states."""
 

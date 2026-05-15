@@ -83,6 +83,7 @@ class TelegramBot:
         self._user_run_tasks: Dict[int, set[asyncio.Task]] = {}
         self._user_voice_tasks: Dict[int, set[asyncio.Task]] = {}
         self._user_queue_locks: Dict[int, asyncio.Lock] = {}
+        self._user_execution_locks: Dict[int, asyncio.Lock] = {}
         # Track currently executing task per user for priority stop command
         self._active_tasks: Dict[int, asyncio.Task] = {}
         self._audio_dir = config.bot_data_dir / "audio"
@@ -1592,11 +1593,46 @@ class TelegramBot:
             max_age_seconds=max_age_seconds,
         )
 
+    def _record_inbound_update(
+        self,
+        *,
+        user_id: int,
+        message: Message,
+        text_preview: str,
+        source: str,
+    ) -> None:
+        try:
+            chat_id = message.chat.id if message.chat else None
+            health_reporter.record_update_received(
+                user_id=user_id,
+                chat_id=chat_id,
+                message_id=message.message_id,
+                text_preview=text_preview,
+                source=source,
+            )
+            logger.info(
+                "Inbound Telegram update: user=%s chat=%s message_id=%s source=%s preview=%r",
+                user_id,
+                chat_id,
+                message.message_id,
+                source,
+                " ".join((text_preview or "").split())[:160],
+            )
+        except Exception as e:
+            logger.warning("Failed to record inbound update: %s", e)
+
     def _get_user_queue_lock(self, user_id: int) -> asyncio.Lock:
         lock = self._user_queue_locks.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
             self._user_queue_locks[user_id] = lock
+        return lock
+
+    def _get_user_execution_lock(self, user_id: int) -> asyncio.Lock:
+        lock = self._user_execution_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_execution_locks[user_id] = lock
         return lock
 
     def _prune_user_tasks(self, user_id: int) -> set[asyncio.Task]:
@@ -1634,6 +1670,9 @@ class TelegramBot:
         for t in list(tasks):
             t.cancel()
         tasks.clear()
+        health_reporter.record_user_queue(
+            user_id=user_id, queued_tasks=0, active=False, event="cleared"
+        )
         return cleared
 
     async def _enqueue_user_task(
@@ -1643,6 +1682,7 @@ class TelegramBot:
         on_overflow: Callable[[], Awaitable[None]],
     ) -> bool:
         lock = self._get_user_queue_lock(user_id)
+        execution_lock = self._get_user_execution_lock(user_id)
         accepted_task: Optional[asyncio.Task] = None
 
         async with lock:
@@ -1652,22 +1692,57 @@ class TelegramBot:
             else:
                 # Wrap run_task to track active task execution
                 async def wrapped_task():
-                    # Store as active task when execution starts
-                    current_task = asyncio.current_task()
-                    self._active_tasks[user_id] = current_task
-                    try:
-                        await run_task()
-                    except asyncio.CancelledError:
-                        # Re-raise to ensure cancellation propagates
-                        raise
-                    finally:
-                        # Remove from active tasks when done
-                        self._active_tasks.pop(user_id, None)
+                    async with execution_lock:
+                        current_task = asyncio.current_task()
+                        self._active_tasks[user_id] = current_task
+                        health_reporter.record_user_queue(
+                            user_id=user_id,
+                            queued_tasks=len(self._prune_user_tasks(user_id)),
+                            active=True,
+                            event="started",
+                        )
+                        try:
+                            await run_task()
+                        except asyncio.CancelledError:
+                            raise
+                        finally:
+                            self._active_tasks.pop(user_id, None)
+                            remaining = max(0, len(self._prune_user_tasks(user_id)) - 1)
+                            health_reporter.record_user_queue(
+                                user_id=user_id,
+                                queued_tasks=remaining,
+                                active=False,
+                                event="finished",
+                            )
 
                 accepted_task = asyncio.create_task(wrapped_task())
                 self._track_user_task(user_id, accepted_task)
+                health_reporter.record_user_queue(
+                    user_id=user_id,
+                    queued_tasks=len(tasks),
+                    active=user_id in self._active_tasks,
+                    event="accepted",
+                )
+                logger.info(
+                    "Accepted user task: user=%s queued_tasks=%s active=%s",
+                    user_id,
+                    len(tasks),
+                    user_id in self._active_tasks,
+                )
 
         if not accepted_task:
+            health_reporter.record_user_queue(
+                user_id=user_id,
+                queued_tasks=len(self._prune_user_tasks(user_id)),
+                active=user_id in self._active_tasks,
+                event="overflow",
+            )
+            logger.warning(
+                "Rejected user task because queue is full: user=%s queued_tasks=%s max=%s",
+                user_id,
+                len(self._prune_user_tasks(user_id)),
+                self._MAX_INFLIGHT_MESSAGES,
+            )
             await on_overflow()
             return False
         return True
@@ -2249,6 +2324,12 @@ class TelegramBot:
             return
         message = self._require_message(update)
         user_id = self._require_user(update).id
+        self._record_inbound_update(
+            user_id=user_id,
+            message=message,
+            text_preview=message.caption or "[attachment]",
+            source="attachment",
+        )
 
         file_obj: Any = None
         kind: str = ""
@@ -2343,6 +2424,12 @@ class TelegramBot:
 
         user_id = self._require_user(update).id
         voice = message.voice
+        self._record_inbound_update(
+            user_id=user_id,
+            message=message,
+            text_preview="[voice]",
+            source="voice",
+        )
         log_debug(user_id, "voice", f"voice:{voice.file_id} duration={voice.duration}")
 
         async def run_task():
@@ -2619,6 +2706,12 @@ class TelegramBot:
 
         user_id = self._require_user(update).id
         text = message.text
+        self._record_inbound_update(
+            user_id=user_id,
+            message=message,
+            text_preview=text,
+            source="text",
+        )
         session = await session_manager.get_session(user_id)
 
         # Check resume selection (user replies with a number)

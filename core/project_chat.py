@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import signal
+import time
 from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable, Deque
@@ -247,6 +248,8 @@ class _PendingRequest:
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None  # StreamingMessageHandler instance
     submitted: bool = False
+    queued_at: float = field(default_factory=time.time)
+    submitted_at: Optional[float] = None
 
 
 @dataclass
@@ -470,6 +473,14 @@ class ProjectChatHandler:
 
         req = state.pending[0]
         if req.submitted:
+            health_reporter.record_sdk_pending(
+                user_id=user_id,
+                pending=len(state.pending),
+                head_request_id=req.request_id,
+                current_request_age_seconds=time.time()
+                - (req.submitted_at or req.queued_at),
+                event="submit-skipped:already-submitted",
+            )
             return False
 
         if req.requested_session_id:
@@ -483,8 +494,17 @@ class ProjectChatHandler:
             sid_source = "default(new-session)"
 
         req.submitted = True
+        req.submitted_at = time.time()
         state.last_recv_at = asyncio.get_event_loop().time()
         await state.client.query(req.user_message, session_id=req.sent_session_id)
+        health_reporter.record_sdk_pending(
+            user_id=user_id,
+            pending=len(state.pending),
+            head_request_id=req.request_id,
+            current_request_age_seconds=time.time()
+            - (req.submitted_at or req.queued_at),
+            event=f"submitted:{reason}",
+        )
         logger.info(
             f"Submitted message to live stream: user={user_id}, request_id={req.request_id}, "
             f"pending={len(state.pending)}, session_key={req.sent_session_id} "
@@ -562,6 +582,14 @@ class ProjectChatHandler:
                     )
                 except Exception as e:
                     logger.error(f"Error setting future result: {e}")
+
+        health_reporter.record_sdk_pending(
+            user_id=user_id,
+            pending=0,
+            head_request_id=None,
+            current_request_age_seconds=None,
+            event="disconnected",
+        )
 
         # Disconnect client. Timeout covers the SDK's own graceful-shutdown
         # ladder (stdin EOF + 5s wait → SIGTERM + 5s wait → SIGKILL), so
@@ -659,6 +687,14 @@ class ProjectChatHandler:
                         f"Idle watchdog: no SDK message for {elapsed:.0f}s for user {user_id} "
                         f"(threshold {IDLE_NO_PROGRESS_SECONDS}s, pending={pending_count}) "
                         f"— disconnecting wedged stream"
+                    )
+                    health_reporter.record_sdk_pending(
+                        user_id=user_id,
+                        pending=pending_count,
+                        head_request_id=req.request_id,
+                        current_request_age_seconds=time.time()
+                        - (req.submitted_at or req.queued_at),
+                        event="idle-watchdog-disconnect",
                     )
                     # Run disconnect off-task: _disconnect_user_stream cancels
                     # this typing task as part of cleanup, so awaiting it inline
@@ -879,6 +915,19 @@ class ProjectChatHandler:
                         except Exception as e:
                             logger.error(f"Error setting future result: {e}")
                     state.pending.popleft()
+                    next_head = state.pending[0] if state.pending else None
+                    health_reporter.record_sdk_pending(
+                        user_id=user_id,
+                        pending=len(state.pending),
+                        head_request_id=next_head.request_id if next_head else None,
+                        current_request_age_seconds=(
+                            time.time()
+                            - (next_head.submitted_at or next_head.queued_at)
+                            if next_head
+                            else None
+                        ),
+                        event="completed",
+                    )
                     logger.info(
                         f"Completed pending request: user={user_id}, request_id={req.request_id}, "
                         f"remaining={len(state.pending)}"
@@ -899,6 +948,13 @@ class ProjectChatHandler:
             # Safely handle pending requests
             pending_copy = list(state.pending)
             state.pending.clear()
+            health_reporter.record_sdk_pending(
+                user_id=user_id,
+                pending=0,
+                head_request_id=None,
+                current_request_age_seconds=None,
+                event="reader-crashed",
+            )
             for req in pending_copy:
                 # Finalize streaming drafts on error
                 if req.streaming_handler:
@@ -979,6 +1035,15 @@ class ProjectChatHandler:
                 )
                 was_idle = not state.pending
                 state.pending.append(request)
+                head = state.pending[0]
+                health_reporter.record_sdk_pending(
+                    user_id=user_id,
+                    pending=len(state.pending),
+                    head_request_id=head.request_id,
+                    current_request_age_seconds=time.time()
+                    - (head.submitted_at or head.queued_at),
+                    event="queued",
+                )
                 logger.info(
                     f"Queued message for live stream: user={user_id}, "
                     f"request_id={request.request_id}, pending={len(state.pending)}, "
@@ -1022,6 +1087,19 @@ class ProjectChatHandler:
                         f"Removed timed-out pending request for user {user_id} "
                         f"(remaining={len(state.pending)})"
                     )
+                    head = state.pending[0] if state.pending else None
+                    health_reporter.record_sdk_pending(
+                        user_id=user_id,
+                        pending=len(state.pending),
+                        head_request_id=head.request_id if head else None,
+                        current_request_age_seconds=(
+                            time.time()
+                            - (head.submitted_at or head.queued_at)
+                            if head
+                            else None
+                        ),
+                        event="request-timeout",
+                    )
                 except ValueError:
                     pass
             if streaming_handler:
@@ -1054,6 +1132,19 @@ class ProjectChatHandler:
             if state and request in state.pending:
                 try:
                     state.pending.remove(request)
+                    head = state.pending[0] if state.pending else None
+                    health_reporter.record_sdk_pending(
+                        user_id=user_id,
+                        pending=len(state.pending),
+                        head_request_id=head.request_id if head else None,
+                        current_request_age_seconds=(
+                            time.time()
+                            - (head.submitted_at or head.queued_at)
+                            if head
+                            else None
+                        ),
+                        event="request-error",
+                    )
                 except ValueError:
                     pass
             # Cancel the request's streaming worker — we removed it from pending
