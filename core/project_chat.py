@@ -329,7 +329,10 @@ class ProjectChatHandler:
         return lock
 
     async def _create_user_stream(
-        self, user_id: int, model: Optional[str]
+        self,
+        user_id: int,
+        model: Optional[str],
+        resume_session_id: Optional[str] = None,
     ) -> _UserStreamState:
         state_holder: Dict[str, _UserStreamState] = {}
 
@@ -407,11 +410,23 @@ class ProjectChatHandler:
             opts["cli_path"] = str(config.claude_cli_path)
         if config.claude_chrome_enabled:
             opts["extra_args"] = {"chrome": None}
+        if resume_session_id:
+            opts["resume"] = resume_session_id
 
         client = ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
         await client.connect()
-        state = _UserStreamState(client=client, model=model)
+        state = _UserStreamState(
+            client=client,
+            model=model,
+            last_session_id=resume_session_id,
+        )
         state_holder["state"] = state
+        if resume_session_id:
+            logger.info(
+                "Created Claude stream with resume session: user=%s session=%s",
+                user_id,
+                resume_session_id,
+            )
         state.reader_task = asyncio.create_task(self._reader_loop(user_id, state))
         state.typing_task = asyncio.create_task(
             self._typing_keepalive_loop(user_id, state)
@@ -647,7 +662,11 @@ class ProjectChatHandler:
         return True
 
     async def _get_or_create_stream(
-        self, user_id: int, model: Optional[str], new_session: bool
+        self,
+        user_id: int,
+        model: Optional[str],
+        new_session: bool,
+        resume_session_id: Optional[str] = None,
     ) -> _UserStreamState:
         lock = self._get_stream_init_lock(user_id)
         async with lock:
@@ -665,8 +684,25 @@ class ProjectChatHandler:
                 await self._disconnect_user_stream(user_id)
                 state = None
 
+            if (
+                state
+                and resume_session_id
+                and state.last_session_id != resume_session_id
+                and not state.pending
+            ):
+                logger.info(
+                    "Recreating Claude stream to resume selected session: "
+                    "user=%s current=%s requested=%s",
+                    user_id,
+                    state.last_session_id,
+                    resume_session_id,
+                )
+                await self._disconnect_user_stream(user_id)
+                state = None
+
             if not state:
-                state = await self._create_user_stream(user_id, model)
+                resume_id = None if new_session else resume_session_id
+                state = await self._create_user_stream(user_id, model, resume_id)
                 self._streams[user_id] = state
             return state
 
@@ -1154,7 +1190,12 @@ class ProjectChatHandler:
         state: Optional[_UserStreamState] = None
 
         try:
-            state = await self._get_or_create_stream(user_id, model, new_session)
+            state = await self._get_or_create_stream(
+                user_id,
+                model,
+                new_session,
+                resume_session_id=session_id,
+            )
             if bot:
                 state.last_bot = bot
                 state.last_chat_id = chat_id

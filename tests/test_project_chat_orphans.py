@@ -62,6 +62,22 @@ class FakeClient:
             await asyncio.sleep(0)
             yield msg
 
+    async def disconnect(self):
+        return None
+
+
+class FakeSDKClient(FakeClient):
+    instances = []
+
+    def __init__(self, options):
+        super().__init__([])
+        self.options = options
+        self.connected = False
+        FakeSDKClient.instances.append(self)
+
+    async def connect(self):
+        self.connected = True
+
 
 class ProjectChatOrphanTests(unittest.TestCase):
     def setUp(self):
@@ -130,6 +146,58 @@ class ProjectChatOrphanTests(unittest.TestCase):
             await handler._reader_loop(123, state)
 
             bot.send_message.assert_awaited_once_with(chat_id=456, text="final report")
+
+        asyncio.run(run())
+
+    def test_new_stream_uses_resume_option_when_session_is_persisted(self):
+        async def run():
+            original_client = project_chat.ClaudeSDKClient
+            project_chat.ClaudeSDKClient = FakeSDKClient
+            FakeSDKClient.instances = []
+            handler = project_chat.ProjectChatHandler()
+            try:
+                state = await handler._get_or_create_stream(
+                    user_id=123,
+                    model=None,
+                    new_session=False,
+                    resume_session_id="session-old",
+                )
+
+                self.assertEqual(state.last_session_id, "session-old")
+                self.assertEqual(FakeSDKClient.instances[-1].options.resume, "session-old")
+            finally:
+                await handler._disconnect_user_stream(123)
+                project_chat.ClaudeSDKClient = original_client
+
+        asyncio.run(run())
+
+    def test_existing_idle_stream_is_recreated_for_selected_resume_session(self):
+        async def run():
+            original_client = project_chat.ClaudeSDKClient
+            project_chat.ClaudeSDKClient = FakeSDKClient
+            FakeSDKClient.instances = []
+            handler = project_chat.ProjectChatHandler()
+            try:
+                first = await handler._get_or_create_stream(
+                    user_id=123,
+                    model=None,
+                    new_session=False,
+                    resume_session_id="session-a",
+                )
+                second = await handler._get_or_create_stream(
+                    user_id=123,
+                    model=None,
+                    new_session=False,
+                    resume_session_id="session-b",
+                )
+
+                self.assertIsNot(first, second)
+                self.assertEqual(second.last_session_id, "session-b")
+                self.assertEqual(len(FakeSDKClient.instances), 2)
+                self.assertEqual(FakeSDKClient.instances[-1].options.resume, "session-b")
+            finally:
+                await handler._disconnect_user_stream(123)
+                project_chat.ClaudeSDKClient = original_client
 
         asyncio.run(run())
 
