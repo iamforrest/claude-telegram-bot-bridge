@@ -154,14 +154,38 @@ async def _send_standalone_notice(req: "_PendingRequest", text: str) -> None:
         logger.error(f"Failed to send standalone notice to {req.chat_id}: {e}")
 
 
-async def _send_chat_notice(bot_obj, chat_id: int, text: str) -> None:
+async def _send_chat_notice(bot_obj, chat_id: int, text: str) -> bool:
     """Like `_send_standalone_notice` but without requiring a live streaming handler."""
     if not bot_obj:
-        return
+        return False
     try:
         await bot_obj.send_message(chat_id=chat_id, text=text)
+        return True
     except Exception as e:
         logger.error(f"Failed to send chat notice to {chat_id}: {e}")
+        return False
+
+
+def _split_telegram_text(text: str, limit: int = 4000) -> List[str]:
+    """Split text into Telegram-sized chunks, preferring paragraph boundaries."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit
+        else:
+            cut += 1
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _format_ask_user_question(tool_input: dict):
@@ -268,6 +292,12 @@ class _UserStreamState:
     # or of the most recent query submit. Idle watchdog cancels the active
     # task if this falls more than IDLE_NO_PROGRESS_SECONDS behind now.
     last_recv_at: float = 0.0
+    # Telegram context from the most recent user request. Claude Code can keep
+    # producing messages after the SDK round-trip that created the Telegram
+    # request has completed, e.g. background tool/task summaries.
+    last_chat_id: Optional[int] = None
+    last_bot: Optional[Any] = None
+    orphan_assistant_texts: List[str] = field(default_factory=list)
 
 
 class ProjectChatHandler:
@@ -741,6 +771,7 @@ class ProjectChatHandler:
                     user_id, state, "before-reader-dispatch"
                 )
                 if not state.pending:
+                    await self._handle_orphan_sdk_message(user_id, state, msg)
                     continue
 
                 req = state.pending[0]
@@ -982,6 +1013,101 @@ class ProjectChatHandler:
                     except Exception as set_err:
                         logger.error(f"Error setting error result: {set_err}")
 
+    async def _handle_orphan_sdk_message(
+        self, user_id: int, state: _UserStreamState, msg: Any
+    ) -> None:
+        """Forward SDK output that arrives after the Telegram request completed.
+
+        Claude Code can return an end_turn to the SDK while background tools or
+        task agents continue writing to the same live stream. At that point
+        `pending` is empty, so the normal request/future path has nobody to
+        receive subsequent AssistantMessage/ResultMessage content. Keep these
+        updates visible by sending them to the most recent chat for the user.
+        """
+        if isinstance(msg, AssistantMessage):
+            text_parts: List[str] = []
+            tool_names: List[str] = []
+            for block in msg.content:
+                if isinstance(block, TextBlock) and block.text:
+                    text_parts.append(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    tool_names.append(block.name)
+
+            if not text_parts:
+                if tool_names:
+                    logger.info(
+                        "Orphan SDK tool_use ignored: user=%s tools=%s",
+                        user_id,
+                        ",".join(tool_names),
+                    )
+                return
+
+            text = self._clean_response("\n".join(text_parts))
+            if not text:
+                return
+            state.orphan_assistant_texts.append(text)
+            await self._send_orphan_text(user_id, state, text)
+            return
+
+        if isinstance(msg, ResultMessage):
+            state.last_session_id = msg.session_id or state.last_session_id
+            result_text = self._clean_response(msg.result or "")
+            if result_text and not state.orphan_assistant_texts:
+                await self._send_orphan_text(user_id, state, result_text)
+            logger.info(
+                "Orphan SDK result observed: user=%s session=%s is_error=%s "
+                "duration=%sms forwarded_text=%s",
+                user_id,
+                msg.session_id,
+                msg.is_error,
+                msg.duration_ms,
+                bool(result_text and not state.orphan_assistant_texts),
+            )
+            state.orphan_assistant_texts.clear()
+            if msg.is_error and result_text:
+                health_reporter.record_claude_error(result_text)
+            elif not msg.is_error:
+                health_reporter.record_claude_ok()
+            return
+
+        if isinstance(msg, RateLimitEvent):
+            info = msg.rate_limit_info
+            logger.warning(
+                "Orphan RateLimitEvent for user %s: status=%s, type=%s, "
+                "resets_at=%s, utilization=%s",
+                user_id,
+                info.status,
+                info.rate_limit_type,
+                info.resets_at,
+                info.utilization,
+            )
+
+    async def _send_orphan_text(
+        self, user_id: int, state: _UserStreamState, text: str
+    ) -> None:
+        if not state.last_bot or state.last_chat_id is None:
+            logger.warning(
+                "Orphan SDK text dropped: user=%s has no Telegram context "
+                "(chars=%s)",
+                user_id,
+                len(text),
+            )
+            return
+
+        sent = 0
+        for part in _split_telegram_text(text):
+            if not part:
+                continue
+            if await _send_chat_notice(state.last_bot, state.last_chat_id, part):
+                sent += 1
+        logger.info(
+            "Orphan SDK text forwarded: user=%s chat=%s chars=%s messages=%s",
+            user_id,
+            state.last_chat_id,
+            len(text),
+            sent,
+        )
+
     async def process_message(
         self,
         user_message: str,
@@ -1029,6 +1155,9 @@ class ProjectChatHandler:
 
         try:
             state = await self._get_or_create_stream(user_id, model, new_session)
+            if bot:
+                state.last_bot = bot
+                state.last_chat_id = chat_id
             async with state.send_lock:
                 await self._discard_completed_pending_head(
                     user_id, state, "before-queue"

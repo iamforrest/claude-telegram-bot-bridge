@@ -16,11 +16,17 @@ class VoiceProviderConfigTests(unittest.TestCase):
                 "PROJECT_ROOT": project_root,
                 "TELEGRAM_BOT_TOKEN": "123456:abc",
                 "TRANSCRIPTION_PROVIDER": "whisper",
+                "AUTO_NEW_SESSION_AFTER_HOURS": "",
             },
             clear=True,
         ):
             sys.modules.pop("telegram_bot.utils.config", None)
-            return importlib.import_module("telegram_bot.utils.config")
+            package = sys.modules.get("telegram_bot.utils")
+            if package is not None and hasattr(package, "config"):
+                delattr(package, "config")
+            module = importlib.import_module("telegram_bot.utils.config")
+            module.Config.model_config["env_file"] = None
+            return module
 
     def test_default_provider_is_whisper(self):
         with TemporaryDirectory() as td:
