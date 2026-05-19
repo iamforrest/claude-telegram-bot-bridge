@@ -4,9 +4,11 @@
 import unittest
 from unittest.mock import AsyncMock, Mock, patch, PropertyMock
 from pathlib import Path
+import asyncio
 import sys
 import types
 import os
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -186,6 +188,30 @@ class TestConnectionResilience(unittest.TestCase):
         _, kwargs = mock_updater.start_polling.call_args
         self.assertEqual(kwargs["allowed_updates"], Update.ALL_TYPES)
         self.assertTrue(kwargs["drop_pending_updates"])
+
+    def test_watchdog_restarts_when_get_updates_stalls(self):
+        """A stuck getUpdates long poll should restart polling even if get_me is healthy."""
+        async def run():
+            mock_updater = Mock()
+            type(mock_updater).running = PropertyMock(return_value=True)
+            mock_updater.stop = AsyncMock()
+
+            mock_app = Mock()
+            mock_app.updater = mock_updater
+            mock_app.bot = Mock()
+            mock_app.bot.get_me = AsyncMock()
+
+            self.bot.application = mock_app
+            self.bot._WATCHDOG_INTERVAL = 0
+            self.bot._POLLING_STALL_THRESHOLD = 1
+            self.bot._polling_request_started_at = time.monotonic() - 2
+
+            with self.assertRaises(bot_module._PollingRestart):
+                await self.bot._polling_watchdog(asyncio.Event())
+
+            mock_updater.stop.assert_awaited_once()
+
+        asyncio.run(run())
 
     @patch("time.time")
     def test_rapid_restart_triggers_system_exit(self, mock_time):

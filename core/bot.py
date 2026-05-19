@@ -59,6 +59,8 @@ from telegram_bot.utils.health import health_reporter
 
 logger = logging.getLogger(__name__)
 STALE_MESSAGE_SECONDS = 20 * 60  # 20 minutes
+_GET_UPDATES_PROBES: Dict[int, Callable[[str, float, Optional[BaseException]], None]] = {}
+_GET_UPDATES_PATCHED_CLASSES: set[type] = set()
 
 
 class _PollingRestart(Exception):
@@ -92,6 +94,10 @@ class TelegramBot:
         self._volcengine_transcriber: Optional[VolcengineFileFastTranscriber] = None
         self._volcengine_tos_uploader: Optional[VolcengineTOSUploader] = None
         self._tts_synthesizer: Optional[MacOSTtsSynthesizer] = None
+        self._polling_request_started_at: Optional[float] = None
+        self._polling_request_last_finished_at: Optional[float] = None
+        self._polling_request_last_error: str = ""
+        self._polling_request_count = 0
 
     # Available models for /model command
     MODELS = [
@@ -107,6 +113,7 @@ class TelegramBot:
     _STALE_AUDIO_SECONDS = 24 * 60 * 60
     _WATCHDOG_INTERVAL = 60
     _NETWORK_FAILURE_THRESHOLD = 300  # 5 min of consecutive failures → force exit
+    _POLLING_STALL_THRESHOLD = 180  # getUpdates should return every ~10s
 
     async def _on_ready(self, application: Application):
         """Called after application.initialize() — sets up commands and cleanup."""
@@ -327,6 +334,7 @@ class TelegramBot:
             watchdog_task = None
             try:
                 await self.application.start()
+                self._install_get_updates_probe()
                 await self.application.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
@@ -406,6 +414,76 @@ class TelegramBot:
 
         logger.info("Bot stopped")
 
+    def _record_get_updates_probe(
+        self, event: str, timestamp: float, error: Optional[BaseException]
+    ) -> None:
+        if event == "start":
+            self._polling_request_started_at = timestamp
+            self._polling_request_count += 1
+            return
+
+        self._polling_request_started_at = None
+        self._polling_request_last_finished_at = timestamp
+        self._polling_request_last_error = "" if error is None else str(error)
+
+    def _polling_get_updates_stall_age(self) -> Optional[float]:
+        if self._polling_request_started_at is None:
+            return None
+        return time.monotonic() - self._polling_request_started_at
+
+    def _install_get_updates_probe(self) -> None:
+        """Track the real getUpdates long-poll call.
+
+        `get_me()` can stay healthy while the Updater's polling task is stuck
+        inside a long-running `get_updates()` call. Wrapping the class method
+        lets the watchdog detect that specific wedge without issuing a second
+        concurrent getUpdates request, which would conflict with polling.
+        """
+        if not self.application:
+            return
+
+        bot = self.application.bot
+        bot_id = id(bot)
+        bot_cls = type(bot)
+        _GET_UPDATES_PROBES[bot_id] = self._record_get_updates_probe
+
+        if bot_cls in _GET_UPDATES_PATCHED_CLASSES:
+            return
+
+        original_get_updates = getattr(bot_cls, "get_updates", None)
+        if not callable(original_get_updates):
+            logger.debug(
+                "Skipping getUpdates probe for bot class without class-level get_updates: %s",
+                bot_cls,
+            )
+            return
+
+        async def get_updates_with_probe(instance, *args, **kwargs):
+            probe = _GET_UPDATES_PROBES.get(id(instance))
+            now = time.monotonic()
+            if probe:
+                probe("start", now, None)
+            try:
+                result = await original_get_updates(instance, *args, **kwargs)
+            except BaseException as e:
+                probe = _GET_UPDATES_PROBES.get(id(instance))
+                if probe:
+                    probe("error", time.monotonic(), e)
+                raise
+            else:
+                probe = _GET_UPDATES_PROBES.get(id(instance))
+                if probe:
+                    probe("success", time.monotonic(), None)
+                return result
+
+        bot_cls.get_updates = get_updates_with_probe
+        _GET_UPDATES_PATCHED_CLASSES.add(bot_cls)
+
+    def _remove_get_updates_probe(self) -> None:
+        if self.application:
+            _GET_UPDATES_PROBES.pop(id(self.application.bot), None)
+        self._polling_request_started_at = None
+
     async def _polling_watchdog(self, stop_event: asyncio.Event):
         """Monitor Telegram API reachability; restart polling if hung."""
         consecutive_failures = 0
@@ -427,6 +505,27 @@ class TelegramBot:
             updater = self.application.updater if self.application else None
             if not self.application or not updater or not updater.running:
                 continue
+
+            stall_age = self._polling_get_updates_stall_age()
+            if stall_age is not None and stall_age >= self._POLLING_STALL_THRESHOLD:
+                message = (
+                    f"telegram getUpdates stalled for {int(stall_age)}s "
+                    f"(threshold {self._POLLING_STALL_THRESHOLD}s)"
+                )
+                health_reporter.record_telegram_error(message, consecutive_failures=1)
+                logger.warning("%s, restarting polling...", message)
+                try:
+                    await asyncio.wait_for(updater.stop(), timeout=15)
+                except asyncio.TimeoutError:
+                    logger.error("updater.stop() timed out, forcing process exit")
+                    os._exit(1)
+                except Exception as stop_err:
+                    logger.error(
+                        "updater.stop() failed (%s), forcing process exit",
+                        stop_err,
+                    )
+                    os._exit(1)
+                raise _PollingRestart()
 
             try:
                 await asyncio.wait_for(self.application.bot.get_me(), timeout=10)
@@ -503,6 +602,7 @@ class TelegramBot:
         except Exception:
             logger.exception("Error during graceful shutdown")
         finally:
+            self._remove_get_updates_probe()
             # Always clear the reference so next build() creates fresh connections
             self.application = None
 
